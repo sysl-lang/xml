@@ -1,0 +1,117 @@
+module sh.sysl.xml
+
+@tests
+
+// Namespaces in XML 1.0: how prefixes resolve, where declarations reach, and what may not be declared.
+
+private val R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+private val MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+
+private ns_doc(text: string) -> &Document = parse(text).expect(s"parses: $text")
+
+@test("the default namespace applies to unprefixed elements and never to unprefixed attributes")
+default_namespace()
+    val d = ns_doc(s"<sheet xmlns='$MAIN' name='S'><row/></sheet>")
+
+    assert_eq(d.root.name.ns, MAIN)
+    assert_eq(d.root.name.prefix, "")
+    assert_eq(d.root.attrs.at(0).name.ns, "")
+    assert_eq(d.root.attr_ns("", "name"), Some("S"))
+    assert_eq(d.root.child("row").unwrap().name.ns, MAIN)
+    assert_eq(d.root.child_ns(MAIN, "row").is_some(), true)
+    assert_eq(d.root.child_ns("", "row").is_none(), true)
+end default_namespace
+
+@test("a prefixed attribute resolves by its URI, whatever the prefix is spelled")
+prefixed_attributes()
+    val a = ns_doc(s"<w xmlns='$MAIN' xmlns:r='$R'><s r:id='rId1' id='plain'/></w>").root.child("s").unwrap()
+    val b = ns_doc(s"<w xmlns='$MAIN' xmlns:rel='$R'><s rel:id='rId1'/></w>").root.child("s").unwrap()
+
+    assert_eq(a.attr_ns(R, "id"), Some("rId1"))
+    assert_eq(b.attr_ns(R, "id"), Some("rId1"))
+    assert_eq(a.attr_ns("", "id"), Some("plain"))
+    assert_eq(a.attr("id"), Some("rId1"))
+    assert_eq(a.attrs.at(0).name, Name("r:id", "r", "id", R))
+    assert_eq(a.attrs.at(0).name.is(R, "id"), true)
+end prefixed_attributes
+
+@test("declarations are kept apart from attributes, in the order written")
+declarations_are_not_attributes()
+    val d = ns_doc(s"<w xmlns='$MAIN' a='1' xmlns:r='$R' r='2'/>")
+
+    assert_eq(d.root.attrs.len(), 2)
+    assert_eq(d.root.attr("r"), Some("2"))
+    assert_eq(d.root.decls.len(), 2)
+    assert_eq(d.root.decls.at(0), NsDecl("", MAIN))
+    assert_eq(d.root.decls.at(1), NsDecl("r", R))
+end declarations_are_not_attributes
+
+@test("a declaration reaches its element and everything inside, and no further")
+declaration_scope()
+    val d = ns_doc("<a:r xmlns:a='u1'><a:x xmlns:a='u2'><a:y/></a:x><a:z/><d xmlns='u3'><e xmlns=''/></d></a:r>")
+    val r = d.root
+
+    assert_eq(r.name.ns, "u1")
+    assert_eq(r.child("x").unwrap().name.ns, "u2")
+    assert_eq(r.child("x").unwrap().child("y").unwrap().name.ns, "u2")
+    assert_eq(r.child("z").unwrap().name.ns, "u1")
+    assert_eq(r.child("d").unwrap().name.ns, "u3")
+    assert_eq(r.child("d").unwrap().child("e").unwrap().name.ns, "")
+end declaration_scope
+
+@test("a declaration may come after the attribute that uses it, in the same start tag")
+declaration_order()
+    val d = ns_doc("<p:r p:a='1' xmlns:p='u'/>")
+
+    assert_eq(d.root.name.ns, "u")
+    assert_eq(d.root.attr_ns("u", "a"), Some("1"))
+@test("the `xml` prefix is bound without a declaration, and may be declared to its own URI")
+xml_prefix()
+    val d = ns_doc("<r xml:lang='en' xml:space='preserve'/>")
+
+    assert_eq(d.root.attr_ns(XML_NS, "lang"), Some("en"))
+    assert_eq(d.root.attr_ns(XML_NS, "space"), Some("preserve"))
+    assert_eq(ns_doc(s"<xml:r xmlns:xml='$XML_NS'/>").root.name.ns, XML_NS)
+end xml_prefix
+
+@test("an undeclared prefix is refused, on an element or an attribute, where it is used")
+undeclared_prefix()
+    assert_eq(refusal("<p:r/>"), "1:2: the namespace prefix `p` is not declared")
+    assert_eq(refusal("<r>\n  <x p:a='1'/></r>"), "2:6: the namespace prefix `p` is not declared")
+    assert_eq(refusal("<r xmlns:p='u'/><!-- out of scope -->"), "accepted")
+    assert_eq(refusal("<r><x xmlns:p='u'/><p:y/></r>"), "1:21: the namespace prefix `p` is not declared")
+@test("what may not be declared: `xmlns`, `xml` elsewhere, either URI elsewhere, an empty prefixed URI")
+reserved_declarations()
+    assert_eq(refusal("<r xmlns:xmlns='u'/>"), "1:4: the prefix `xmlns` is bound already and may not be declared")
+    assert_eq(refusal("<r xmlns:xml='u'/>"), s"1:4: the prefix `xml` may only be bound to `$XML_NS`")
+    assert_eq(refusal(s"<r xmlns:x='$XML_NS'/>"), s"1:4: only the prefix `xml` may be bound to `$XML_NS`")
+    assert_eq(refusal(s"<r xmlns='$XML_NS'/>"), s"1:4: only the prefix `xml` may be bound to `$XML_NS`")
+    assert_eq(refusal(s"<r xmlns:x='$XMLNS_NS'/>"), s"1:4: no prefix may be bound to `$XMLNS_NS`")
+    assert_eq(refusal("<r xmlns:p=''/>"), "1:4: `xmlns:p=\"\"` cannot undeclare a prefix in XML 1.0")
+    assert_eq(refusal("<r xmlns=''/>"), "accepted")
+    assert_eq(refusal("<xmlns:r/>"), "1:2: the prefix `xmlns` is reserved for namespace declarations")
+    assert_eq(refusal("<r xmlns='a' xmlns='b'/>"), "1:14: the attribute `xmlns` is given twice in one start tag")
+    assert_eq(refusal("<r xmlns:p='a' xmlns:p='b'/>"), "1:16: the attribute `xmlns:p` is given twice in one start tag")
+end reserved_declarations
+
+@test("two attributes with one local name in one namespace are the same attribute")
+duplicate_expanded_attributes()
+    assert_eq(refusal("<r xmlns:a='u' xmlns:b='u' a:x='1' b:x='2'/>"),
+        "1:36: `b:x` and `a:x` are the same attribute: both are `x` in `u`")
+    assert_eq(refusal("<r xmlns:a='u' xmlns:b='v' a:x='1' b:x='2' x='3'/>"), "accepted")
+    assert_eq(refusal("<r xmlns='u' xmlns:a='u' x='1' a:x='2'/>"), "accepted")
+@test("a name that is not a qualified name is refused: two colons, or a colon at either end")
+qualified_names()
+    assert_eq(refusal("<a:b:c xmlns:a='u'/>"),
+        "1:2: `a:b:c` is not a qualified name: a name holds at most one colon, between a prefix and a local part")
+    assert_eq(refusal("<:a/>"), "1:2: `:a` is not a qualified name: a name holds at most one colon, between a prefix and a local part")
+    assert_eq(refusal("<a:/>"), "1:2: `a:` is not a qualified name: a name holds at most one colon, between a prefix and a local part")
+    assert_eq(refusal("<a:1 xmlns:a='u'/>"), "1:2: `a:1` is not a qualified name: the part after the colon must begin a name")
+    assert_eq(refusal("<r x:y:z='1'/>"),
+        "1:4: `x:y:z` is not a qualified name: a name holds at most one colon, between a prefix and a local part")
+    assert_eq(refusal("<r xmlns:a:b='u'/>"), "1:4: `a:b` is not a namespace prefix: a prefix is a name with no colon")
+end qualified_names
+
+@test("an end tag matches its start tag as written, not as resolved")
+end_tags_match_as_written()
+    assert_eq(refusal("<a:r xmlns:a='u' xmlns:b='u'></b:r>"), "1:30: `</b:r>` does not close `<a:r>`, opened at 1:1")

@@ -1,0 +1,185 @@
+module sh.sysl.xml
+
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.parse_long
+
+// The pull reader: the events, in order, and what it hands over before a mistake further on.
+
+// Every event of `text` up to and including `Eof`, or the error that stopped it.
+private[xml] events(text: string) -> Result[Buf[Event], XmlError]
+    var r = reader(text)
+    var out: Buf[Event] = buf()
+
+    loop
+        val e = r.next()?
+
+        out.push(e)
+
+        if e == Eof then return Ok(out)
+end events
+
+private plain(qname: string, local: string) -> Name = Name(qname, "", local, "")
+
+@test("each kind of markup is one event, and an empty-element tag is a start and an end")
+event_sequence()
+    val got = events("<?xml version='1.0'?><!DOCTYPE r><!--c--><r a='1'><e/>t<![CDATA[d]]><?p q?></r>").unwrap()
+    var attrs: Buf[Attr] = buf()
+
+    attrs.push(Attr(plain("a", "a"), "1"))
+
+    assert_eq(got.len(), 10)
+    assert_eq(got.at(0), Doctype("r"))
+    assert_eq(got.at(1), Event.Comment("c"))
+    assert_eq(got.at(2), Start(plain("r", "r"), attrs, buf()))
+    assert_eq(got.at(3), Start(plain("e", "e"), buf(), buf()))
+    assert_eq(got.at(4), End(plain("e", "e")))
+    assert_eq(got.at(5), Event.Text("t"))
+    assert_eq(got.at(6), Event.CData("d"))
+    assert_eq(got.at(7), Event.Pi("p", "q"))
+    assert_eq(got.at(8), End(plain("r", "r")))
+    assert_eq(got.at(9), Eof)
+end event_sequence
+
+@test("whitespace inside the root is text, and outside it is not an event at all")
+whitespace_events()
+    val got = events("\n <r>\n <e/>\n</r>\n ").unwrap()
+
+    assert_eq(got.len(), 7)
+    assert_eq(got.at(0), Start(plain("r", "r"), buf(), buf()))
+    assert_eq(got.at(1), Event.Text("\n "))
+    assert_eq(got.at(4), Event.Text("\n"))
+end whitespace_events
+
+@test("the declaration is read before the first event, and the end answers `Eof` again when asked again")
+declaration_and_eof()
+    var r = reader("<?xml version='1.0' encoding='UTF-8'?><r/>")
+
+    assert_eq(r.next().map(e -> e == Start(plain("r", "r"), buf(), buf())), Ok(true))
+    assert_eq(r.version, "1.0")
+    assert_eq(r.encoding, "UTF-8")
+    assert_eq(r.depth, 1)
+    assert_eq(r.next(), Ok(End(plain("r", "r"))))
+    assert_eq(r.depth, 0)
+    assert_eq(r.next(), Ok(Eof))
+    assert_eq(r.next(), Ok(Eof))
+end declaration_and_eof
+
+@test("events before a mistake are handed over, and the mistake comes when it is reached")
+events_before_a_mistake()
+    var r = reader("<r><c>1</c><c>2</d></r>")
+    var texts: Buf[string] = buf()
+
+    loop
+        r.next() match
+            Ok(Event.Text(t)) -> texts.push(t)
+            Ok(Eof) -> break
+            Ok(_) -> ()
+            Err(e) ->
+                assert_eq(e.to_string(), "1:16: `</d>` does not close `<c>`, opened at 1:12")
+                break
+
+    assert_eq(texts.view(), ["1", "2"])
+end events_before_a_mistake
+
+@test("the reader and the tree refuse a document with the same error")
+reader_and_tree_agree()
+    val cases = ["<a><b></a>", "<r a='1' a='2'/>", "<p:r/>", "<r>&bad;</r>", "<r/><r/>", "", "<r>\u{1}</r>"]
+
+    for c in cases
+        val tree = parse(c).map(d -> d.root.local)
+        val pulled = events(c).map(es -> es.len())
+
+        assert_eq(tree.map_err(e -> e.to_string()).is_err(), true, c)
+        assert_eq(pulled.map_err(e -> e.to_string()).err(), tree.map_err(e -> e.to_string()).err(), c)
+end reader_and_tree_agree
+
+// A worksheet of `rows` rows of eight numeric cells, cell (r, c) holding `r * 8 + c`.
+private[xml] big_sheet(rows: usize) -> string
+    var w = writer()
+
+    w.declaration(Some(true))
+    w.open("worksheet")
+    w.ns("", "http://schemas.openxmlformats.org/spreadsheetml/2006/main")
+    w.open("sheetData")
+
+    for r in 1..rows
+        w.open("row")
+        w.attr("r", r.to_string())
+
+        for c in 0..<8
+            w.open("c")
+            w.attr("r", s"${"ABCDEFGH"[c..<c + 1]}$r")
+            w.element("v", (r * 8 + c).to_string())
+            w.close()
+
+        w.close()
+
+    w.close()
+    w.close()
+    w.finish().unwrap()
+end big_sheet
+
+@test("a sheet of a megabyte and more reads the same through the tree and through the events")
+big_document()
+    val rows: usize = 8000
+    val text = big_sheet(rows)
+
+    assert(text.len > 1000000, "the sheet is over a megabyte")
+
+    var want: long = 0
+
+    for r in 1..rows
+        for c in 0..<8
+            want += long(r * 8 + c)
+
+    // Through the events, the way a consumer that wants only the values reads a large sheet.
+    var r = reader(text)
+    var in_v = false
+    var sum: long = 0
+    var cells: usize = 0
+
+    loop
+        r.next().unwrap() match
+            Start(n, _, _) ->
+                in_v = n.local == "v"
+
+                if n.local == "c" then cells += 1
+            Event.Text(t) -> if in_v then sum += parse_long(t).unwrap()
+            End(_) -> in_v = false
+            Eof -> break
+            _ -> ()
+
+    assert_eq(cells, rows * 8)
+    assert_eq(sum, want)
+
+    // Through the tree.
+    val data = parse(text).unwrap().root.child("sheetData").unwrap().elements_named("row")
+    var tree_sum: long = 0
+
+    assert_eq(data.len(), rows)
+
+    for i in 0..<data.len()
+        val cs = data.at(i).elements_named("c")
+
+        for j in 0..<cs.len()
+            tree_sum += parse_long(cs.at(j).text()).unwrap()
+
+    assert_eq(tree_sum, want)
+    assert_eq(data.at(rows - 1).elements_named("c").at(7).attr("r"), Some(s"H$rows"))
+end big_document
+
+@test("an element's declarations go out of scope at its end, with the reader still inside the parent")
+scope_through_events()
+    var r = reader("<r xmlns='u'><x xmlns='v'/><y/></r>")
+    var seen: Buf[string] = buf()
+
+    loop
+        r.next().unwrap() match
+            Start(n, _, _) -> seen.push(s"${n.local}=${n.ns}")
+            Eof -> break
+            _ -> ()
+
+    assert_eq(seen.view(), ["r=u", "x=v", "y=u"])
+end scope_through_events

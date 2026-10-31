@@ -28,8 +28,6 @@ private[xml] fixtures_dir() -> string
     val cut = here.last_index_of("/sh/sysl/xml/").expect("this file sits under sh/sysl/xml")
 
     s"${here[0..<cut]}/tests"
-end fixtures_dir
-
 private[xml] fixture(name: string) -> string =
     text_of(read_bytes(s"${fixtures_dir()}/fixtures/$name").unwrap()).unwrap()
 
@@ -68,8 +66,6 @@ private[xml] struct Dump
         self.flush()
         self.out.push(s)
         self.out.push("\n")
-    end line
-
     chars(*self, t: string)
         self.text.push(t)
         self.pending = true
@@ -96,7 +92,6 @@ private[xml] struct Dump
     finish(*self) -> string
         self.flush()
         self.out.finish()
-    end finish
 end Dump
 
 private[xml] dump() -> Dump = Dump(str_builder(), str_builder(), false)

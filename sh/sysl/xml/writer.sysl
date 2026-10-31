@@ -98,8 +98,6 @@ struct XmlWriter
 
         self.end_start_tag()
         self.escaped(text, false)
-    end text
-
     // A CDATA section. Text holding `]]>` is split across two sections, which reads back as the same
     // text.
     cdata(*self, text: string)
@@ -177,8 +175,6 @@ struct XmlWriter
         self.open(name)
         self.text(text)
         self.close()
-    end element
-
     // The document, or the first mistake made writing it. An element still open is a mistake.
     finish(self) -> Result[string, WriteError]
         self.error match
@@ -208,8 +204,6 @@ struct XmlWriter
         if self.in_tag then
             self.out.push(">")
             self.in_tag = false
-    end end_start_tag
-
     // Whether `text` holds only characters XML allows; the first that it does not is the mistake.
     private legal(*self, text: string) -> bool
         for i in 0..<text.len

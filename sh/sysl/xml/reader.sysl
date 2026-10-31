@@ -2,7 +2,7 @@ module sh.sysl.xml
 
 import sysl.buf.{Buf, buf}
 import sysl.text.{StrBuilder, str_builder, char_from_u32, eq_fold}
-import sh.sysl.parsing.{Scanner, scanner, ByteSet, byte_set_of, Span, source, found_at, read_digits}
+import sh.sysl.parsing.{Scanner, scanner, ByteSet, byte_set_of, byte_range, Span, source, found_at, read_digits}
 
 // The pull reader: one document, handed out one event at a time.
 //
@@ -24,7 +24,7 @@ import sh.sysl.parsing.{Scanner, scanner, ByteSet, byte_set_of, Span, source, fo
 //
 // **An empty-element tag is a `Start` followed by an `End`**, so a consumer has one shape to handle
 // whichever way the document spelled an empty element.
-enum Event
+enum Event derives Eq
     // A start tag, with its attributes (namespace declarations taken out) and the declarations
     // themselves. Names are resolved: `name.ns` and each attribute's `name.ns` are URIs.
     Start(name: Name, attrs: Buf[Attr], decls: Buf[NsDecl])
@@ -66,6 +66,10 @@ private val ATTR_STOP_SQ: ByteSet = ATTR_STOP.with(u8('\''))
 // A comment, a CDATA section and a processing instruction: no references, but line ends and the
 // characters XML refuses still matter. The first byte of the closing delimiter is added per call.
 private val RAW_STOP: ByteSet = CONTROL.with(u8('\r')).with(LEAD_EF)
+
+// What a public identifier may be written with (production [13]).
+private val PUBID: ByteSet = byte_set_of(" \r\n-'()+,./:=?;!*#@$_%")
+    .union(byte_range(u8('a'), u8('z'))).union(byte_range(u8('A'), u8('Z'))).union(byte_range(u8('0'), u8('9')))
 
 // The UTF-8 byte order mark, which a document may begin with and which is not part of it.
 private val BOM: [3]u8 = [0xEF, 0xBB, 0xBF]
@@ -288,9 +292,10 @@ struct Reader
             None -> Err(self.fail(start - 1, s"the value of `$name` is not closed"))
     end decl_value
 
-    // `<!DOCTYPE root ...>`, which is skipped: its quoted literals, and an internal subset with its
-    // own comments and processing instructions, are stepped over so that a `>` inside one of them
-    // does not end it early.
+    // `<!DOCTYPE root SYSTEM "..." [ ... ]>`. Its shape is checked -- the external identifier, and
+    // that the internal subset is a run of declarations, parameter-entity references, comments and
+    // processing instructions -- and its meaning is not: nothing declared in it is acted on, and the
+    // inside of a declaration is stepped over rather than parsed.
     private doctype(*self, at: usize) -> Result[Event, XmlError]
         if self.seen_root || !self.open.is_empty() then
             return Err(self.fail(at, "a DOCTYPE is only allowed before the root element"))
@@ -303,38 +308,127 @@ struct Reader
             return Err(self.expected(self.s.offset, "whitespace after `<!DOCTYPE`"))
 
         val name = self.read_name("the root element's name")?
-        var subset = false
+        var ws = self.s.accept_while_set(SPACE)
+
+        if self.s.starts_with("SYSTEM".bytes) || self.s.starts_with("PUBLIC".bytes) then
+            if ws == 0 then return Err(self.expected(self.s.offset, "whitespace before the external identifier"))
+
+            val public = self.s.starts_with("PUBLIC".bytes)
+
+            self.s.skip(6)
+
+            if self.s.accept_while_set(SPACE) == 0 then
+                return Err(self.expected(self.s.offset, "whitespace and a quoted literal"))
+
+            self.literal(public)?
+
+            if public then
+                if self.s.accept_while_set(SPACE) == 0 then
+                    return Err(self.expected(self.s.offset, "whitespace and the system literal"))
+
+                self.literal(false)?
+
+            self.s.accept_while_set(SPACE)
+
+        if self.s.accept(u8('[')) then
+            self.subset(at)?
+            self.s.accept_while_set(SPACE)
+
+        if !self.s.accept(u8('>')) then return Err(self.expected(self.s.offset, "`>` to end the DOCTYPE"))
+
+        Ok(Doctype(self.text[name.start..<name.end]))
+    end doctype
+
+    // A quoted literal in a DOCTYPE, its characters checked: any character for a system literal, the
+    // `PubidChar`s for a public one.
+    private literal(*self, public: bool) -> Result[unit, XmlError]
+        val q = self.s.peek().unwrap_or(0)
+
+        if q != u8('"') && q != u8('\'') then return Err(self.expected(self.s.offset, "a quoted literal"))
+
+        val open_at = self.s.offset
+
+        self.s.bump()
 
         loop
             val c = self.s.peek() match
                 Some(c) -> c
-                None -> return Err(self.fail(at, "the DOCTYPE is not closed; the input ended inside it"))
+                None -> return Err(self.fail(open_at, "the literal is not closed; the input ended inside it"))
 
-            if c == u8('"') || c == u8('\'') then
+            if c == q then
                 self.s.bump()
+                return Ok(())
 
-                self.s.find(c) match
-                    Some(end) -> self.s.skip(end - self.s.offset + 1)
-                    None -> return Err(self.fail(at, "a quoted literal in the DOCTYPE is not closed"))
-            elif subset && self.s.accept_seq("<!--".bytes) then
-                self.raw_until("-->".bytes, "comment", at)?
-            elif subset && self.s.accept_seq("<?".bytes) then
-                self.raw_until("?>".bytes, "processing instruction", at)?
-            elif subset && self.s.starts_with("<!ENTITY".bytes) then
-                self.entity_decls = true
+            if public && !PUBID.has(c) then
+                return Err(self.fail(self.s.offset, s"${found_at(source("xml", self.text.bytes), Span(self.s.offset, self.s.offset + 1))} is not allowed in a public identifier"))
+
+            self.legal_byte()?
+    end literal
+
+    // One byte of a DOCTYPE stepped over, refused if it begins a character XML does not allow.
+    private legal_byte(*self) -> Result[unit, XmlError]
+        val c = self.text.bytes[self.s.offset]
+
+        if CONTROL.has(c) || c == LEAD_EF then return self.odd_byte()
+
+        self.s.bump()
+        Ok(())
+    end legal_byte
+
+    // The internal subset, after its `[`, up to and past its `]`.
+    private subset(*self, at: usize) -> Result[unit, XmlError]
+        loop
+            self.s.accept_while_set(SPACE)
+
+            val here = self.s.offset
+            val c = self.s.peek() match
+                Some(c) -> c
+                None -> return Err(self.fail(at, "the DOCTYPE's internal subset is not closed; the input ended inside it"))
+
+            if c == u8(']') then
                 self.s.bump()
-            elif !subset && c == u8('[') then
-                subset = true
+                return Ok(())
+
+            if c == u8('%') then
                 self.s.bump()
-            elif subset && c == u8(']') then
-                subset = false
-                self.s.bump()
-            elif !subset && c == u8('>') then
-                self.s.bump()
-                return Ok(Doctype(self.text[name.start..<name.end]))
+                self.read_name("a parameter-entity name after `%`")?
+
+                if !self.s.accept(u8(';')) then return Err(self.expected(self.s.offset, "`;` to end the parameter-entity reference"))
+            elif self.s.accept_seq("<!--".bytes) then
+                self.raw_until("-->".bytes, "comment", here)?
+            elif self.s.accept_seq("<?".bytes) then
+                self.pi(here)?
+            elif self.s.accept_seq("<!".bytes) then
+                val kw = self.s.offset
+
+                if self.s.starts_with("ENTITY".bytes) then self.entity_decls = true
+
+                if !self.s.accept_seq("ELEMENT".bytes) && !self.s.accept_seq("ATTLIST".bytes) &&
+                    !self.s.accept_seq("ENTITY".bytes) && !self.s.accept_seq("NOTATION".bytes) then
+                    return Err(self.expected(kw, "`ELEMENT`, `ATTLIST`, `ENTITY` or `NOTATION` after `<!`"))
+
+                if self.s.accept_while_set(SPACE) == 0 then
+                    return Err(self.expected(self.s.offset, s"whitespace after `<!${self.text[kw..<self.s.offset]}`"))
+
+                self.declaration_body(here)?
             else
+                return Err(self.expected(here, "a markup declaration, `]` or a comment in the internal subset"))
+    end subset
+
+    // The rest of a markup declaration, up to and past its `>`, stepping over quoted literals so that
+    // a `>` inside one does not end it.
+    private declaration_body(*self, at: usize) -> Result[unit, XmlError]
+        loop
+            val c = self.s.peek() match
+                Some(c) -> c
+                None -> return Err(self.fail(at, "the declaration is not closed; the input ended inside it"))
+
+            if c == u8('>') then
                 self.s.bump()
-    end doctype
+                return Ok(())
+
+            if c == u8('"') || c == u8('\'') then self.literal(false)? else self.legal_byte()?
+    end declaration_body
 
     // -- tags ---------------------------------------------------------------------------------------
 
@@ -455,15 +549,17 @@ struct Reader
         self.opened.pop()
         self.scopes.truncate(self.marks.pop().unwrap_or(0))
         self.open.pop().expect("an element is open when one is closed")
-    end close
-
     // -- namespaces ---------------------------------------------------------------------------------
 
     // A qualified name's two halves, or the error Namespaces gives for a name that is not one.
+    //
+    // `q` was read as a `Name`, so every character in it is a name character and the first is a start
+    // character. With the colon rule kept, the prefix is therefore an `NCName` already, and only the
+    // local part's first character is left to ask about.
     private split(self, at: usize, q: string) -> Result[(string, string), XmlError]
         split_qname(q) match
             Some((p, l)) ->
-                if (p.is_empty() || is_ncname(p)) && is_ncname(l) then return Ok((p, l))
+                if p.is_empty() || begins_name(l) then return Ok((p, l))
 
                 Err(self.fail(at, s"`$q` is not a qualified name: the part after the colon must begin a name"))
             None -> Err(self.fail(at, s"`$q` is not a qualified name: a name holds at most one colon, between a prefix and a local part"))

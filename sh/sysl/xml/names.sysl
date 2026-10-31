@@ -66,7 +66,6 @@ private[xml] fail_at(text: []const u8, offset: usize, message: string) -> XmlErr
     val loc = source("xml", text).locate(offset)
 
     XmlError(loc.line, loc.col, offset, message)
-end fail_at
 
 // -- character classes ------------------------------------------------------------------------
 
@@ -130,6 +129,19 @@ private[xml] is_name(text: string) -> bool
     true
 end is_name
 
+// Whether the first character of `text` may begin a name.
+private[xml] begins_name(text: string) -> bool
+    if text.is_empty() then return false
+
+    val c = text.bytes[0]
+
+    if c < 128 then return NAME_START.has(c)
+
+    chars_of(text.bytes).peek() match
+        Some(ch) -> wide_name_start(u32(ch))
+        None -> false
+end begins_name
+
 // Whether `text` is an `NCName` -- a name with no colon, which is what a prefix and a local part are.
 private[xml] is_ncname(text: string) -> bool = is_name(text) && !has_colon(text)
 
@@ -138,7 +150,6 @@ private[xml] has_colon(text: string) -> bool
         if text.bytes[i] == u8(':') then return true
 
     false
-end has_colon
 
 // Whether `text` is a qualified name: one `NCName`, or two joined by a single colon.
 private[xml] is_qname(text: string) -> bool

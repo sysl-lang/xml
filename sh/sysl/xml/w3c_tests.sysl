@@ -1,0 +1,209 @@
+module sh.sysl.xml
+
+@tests
+
+// The W3C XML conformance suite -- James Clark's `xmltest`, from `xmlts20130923` -- as far as it
+// speaks to a reader that checks well-formedness and namespaces and does not read DTDs. The suite is
+// fetched from w3.org on the first run (see `suite`), so these two tests need `curl`, `shasum` and
+// `tar`, and the network once.
+//
+// - **`NOT_WF`: the standalone not-well-formed cases**, each of which must be refused. Taken: every
+//   `not-wf/sa` case with `ENTITIES="none"`, less the two that apply to editions 1-4 only (the fifth
+//   edition widened the name characters): 181 cases. 132 are refused; `KEPT_BY_DESIGN` names the 49
+//   that are not, and the test checks they are still accepted, so a change to either list is seen.
+// - **`VALID`: the standalone valid cases with a canonical output**, each read and written in James
+//   Clark's canonical form and compared byte for byte with the suite's `out/` file. Taken: every
+//   `valid/sa` case that declares no entity and no attribute list (whose defaults and types change the
+//   values a DTD-reading processor reports), is namespace-well-formed, is UTF-8, and whose output is in
+//   the first canonical form: 53 cases, every one of them matched.
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{read_bytes, is_dir, make_dir_all, remove_dir_all, publish_dir}
+import sysl.process.{capture, pid}
+import sysl.slices.sort_by
+import sysl.text.{str_builder, StrBuilder}
+
+// Not-well-formed cases this reader accepts. **Every one is a mistake inside a markup declaration in
+// an internal subset** -- a malformed content model, attribute type, entity value or reference
+// between `<!ELEMENT`, `<!ATTLIST`, `<!ENTITY` or `<!NOTATION` and its `>`. The reader checks the
+// DOCTYPE's shape (its external identifier, that the subset is declarations, comments, processing
+// instructions and parameter-entity references, and every character in it) and steps over the inside
+// of each declaration, since nothing declared is acted on.
+private val KEPT_BY_DESIGN = [
+    "054.xml", "057.xml", "058.xml", "059.xml", "060.xml", "061.xml", "062.xml", "064.xml",
+    "065.xml", "066.xml", "067.xml", "068.xml", "069.xml", "078.xml", "079.xml", "080.xml",
+    "084.xml", "086.xml", "087.xml", "089.xml", "091.xml", "113.xml", "114.xml", "121.xml",
+    "122.xml", "123.xml", "124.xml", "125.xml", "126.xml", "127.xml", "128.xml", "129.xml",
+    "130.xml", "131.xml", "132.xml", "133.xml", "134.xml", "135.xml", "136.xml", "137.xml",
+    "138.xml", "139.xml", "158.xml", "160.xml", "161.xml", "162.xml", "180.xml", "183.xml",
+    "184.xml"]
+
+// The cases taken, by number: `not-wf/sa/<n>.xml` and `valid/sa/<n>.xml`, chosen as the comment at
+// the top of this file says.
+private val NOT_WF = [
+    "001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013",
+    "014", "015", "016", "017", "018", "019", "020", "021", "022", "023", "024", "025", "026",
+    "027", "028", "029", "030", "031", "032", "033", "034", "035", "036", "037", "038", "039",
+    "040", "041", "042", "043", "044", "045", "046", "047", "048", "049", "050", "051", "052",
+    "053", "054", "055", "056", "057", "058", "059", "060", "061", "062", "063", "064", "065",
+    "066", "067", "068", "069", "070", "071", "072", "073", "074", "075", "076", "077", "078",
+    "079", "080", "083", "084", "085", "086", "087", "088", "089", "090", "091", "092", "093",
+    "094", "095", "096", "097", "098", "099", "100", "101", "102", "103", "104", "105", "106",
+    "107", "108", "109", "110", "111", "112", "113", "114", "115", "116", "117", "118", "119",
+    "120", "121", "122", "123", "124", "125", "126", "127", "128", "129", "130", "131", "132",
+    "133", "134", "135", "136", "137", "138", "139", "142", "143", "144", "145", "146", "147",
+    "148", "149", "150", "151", "152", "153", "154", "155", "156", "157", "158", "159", "160",
+    "161", "162", "163", "164", "165", "166", "167", "168", "169", "170", "171", "172", "173",
+    "174", "175", "176", "177", "178", "179", "180", "181", "182", "183", "184", "186"]
+
+private val VALID = [
+    "001", "002", "003", "007", "008", "009", "016", "017", "017a", "018", "019", "020", "021",
+    "022", "025", "026", "027", "028", "029", "030", "031", "032", "033", "034", "035", "036",
+    "037", "038", "039", "042", "047", "048", "052", "054", "055", "056", "057", "060", "061",
+    "062", "063", "064", "067", "081", "084", "092", "093", "098", "099", "103", "112", "116",
+    "119"]
+
+private val SUITE_URL = "https://www.w3.org/XML/Test/xmlts20130923.tar.gz"
+private val SUITE_SHA256 = "9b61db9f5dbffa545f4b8d78422167083a8568c59bd1129f94138f936cf6fc1f"
+
+// The suite's `xmltest` directory, fetched and unpacked under `tests/w3c/` the first time a test
+// asks for it, and checked against its SHA-256 before it is unpacked.
+//
+// **It is fetched rather than checked in because its licence says so**: James Clark's collection may
+// be redistributed only as the original archive, unmodified. The unpacking is published with a rename,
+// so two test processes racing to fetch it both end with one whole copy.
+private suite() -> string
+    val root = s"${fixtures_dir()}/w3c"
+    val dir = s"$root/xmlconf/xmltest"
+
+    if is_dir(dir) then return dir
+
+    val pending = s"$root/pending-${pid()}"
+
+    make_dir_all(pending).unwrap()
+
+    val tarball = s"$pending/xmlts.tar.gz"
+
+    assert(capture("curl", ["-sSfL", "-o", tarball, SUITE_URL]).unwrap().status.ok(), s"fetched $SUITE_URL")
+    assert(capture("shasum", ["-a", "256", tarball]).unwrap().text.starts_with(SUITE_SHA256), "the archive is the one these tests were written against")
+    assert(capture("tar", ["xzf", tarball, "-C", pending]).unwrap().status.ok(), "the archive unpacks")
+    publish_dir(s"$pending/xmlconf", s"$root/xmlconf").unwrap()
+    remove_dir_all(pending).unwrap()
+    dir
+end suite
+
+private kept_by_design(name: string) -> bool
+    for k in KEPT_BY_DESIGN
+        if k == name then return true
+
+    false
+// Text in the canonical form's escaping: the three markup characters, the quote, and the three
+// whitespace characters as references.
+private canon_text(b: *StrBuilder, t: string)
+    for i in 0..<t.len
+        val c = t.bytes[i]
+
+        if c == u8('&') then
+            b.push("&amp;")
+        elif c == u8('<') then
+            b.push("&lt;")
+        elif c == u8('>') then
+            b.push("&gt;")
+        elif c == u8('"') then
+            b.push("&quot;")
+        elif c == u8('\t') then
+            b.push("&#9;")
+        elif c == u8('\n') then
+            b.push("&#10;")
+        elif c == u8('\r') then
+            b.push("&#13;")
+        else
+            b.bytes.push(c)
+end canon_text
+
+private canon_nodes(b: *StrBuilder, nodes: Buf[Node])
+    for i in 0..<nodes.len()
+        nodes.at(i) match
+            Elem(e) -> canon_element(b, e)
+            Node.Text(t) -> canon_text(b, t)
+            Node.CData(t) -> canon_text(b, t)
+            Node.Comment(_) -> ()
+            Node.Pi(t, d) ->
+                b.push("<?")
+                b.push(t)
+                b.push(" ")
+                b.push(d)
+                b.push("?>")
+end canon_nodes
+
+// `<name a="v" ...>content</name>`, attributes sorted by name. The canonical form predates
+// namespaces, so a declaration is an attribute like any other.
+private canon_element(b: *StrBuilder, e: &Element)
+    var attrs: Buf[(string, string)] = buf()
+
+    for i in 0..<e.decls.len()
+        val d = e.decls.at(i)
+
+        attrs.push((if d.prefix.is_empty() then "xmlns" else s"xmlns:${d.prefix}", d.uri))
+
+    for i in 0..<e.attrs.len()
+        attrs.push((e.attrs.at(i).name.qname, e.attrs.at(i).value))
+
+    sort_by(attrs.view(), (x, y) -> x.0 < y.0)
+
+    b.push("<")
+    b.push(e.name.qname)
+
+    for i in 0..<attrs.len()
+        b.push(" ")
+        b.push(attrs.at(i).0)
+        b.push("=\"")
+        canon_text(b, attrs.at(i).1)
+        b.push("\"")
+
+    b.push(">")
+    canon_nodes(b, e.children)
+    b.push("</")
+    b.push(e.name.qname)
+    b.push(">")
+end canon_element
+
+private canonical(d: &Document) -> string
+    var b = str_builder()
+
+    canon_nodes(&b, d.children)
+    b.finish()
+
+@test("every not-well-formed case of the W3C suite is refused, but for those inside declarations")
+w3c_not_wf_refused()
+    val dir = s"${suite()}/not-wf/sa"
+    var wrong: Buf[string] = buf()
+    var refused = 0
+
+    for id in NOT_WF
+        val name = s"$id.xml"
+        val accepted = parse_bytes(read_bytes(s"$dir/$name").unwrap()).is_ok()
+
+        if accepted != kept_by_design(name) then wrong.push(name)
+
+        if !accepted then refused += 1
+
+    assert_eq(wrong.view(), [], "the cases this reader gets wrong")
+    assert_eq(refused, 132)
+end w3c_not_wf_refused
+
+@test("every valid case of the W3C suite reads to its canonical output")
+w3c_valid_canonical()
+    val dir = s"${suite()}/valid/sa"
+    var wrong: Buf[string] = buf()
+
+    for id in VALID
+        val name = s"$id.xml"
+        val want = text_of(read_bytes(s"$dir/out/$name").unwrap()).unwrap()
+
+        parse_bytes(read_bytes(s"$dir/$name").unwrap()) match
+            Ok(doc) -> if canonical(doc) != want then wrong.push(s"$name: ${canonical(doc)} != $want")
+            Err(e) -> wrong.push(s"$name: $e")
+
+    assert_eq(wrong.view(), [], "the cases this reader gets wrong")
+end w3c_valid_canonical

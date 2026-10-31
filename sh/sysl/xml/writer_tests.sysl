@@ -1,0 +1,254 @@
+module sh.sysl.xml
+
+@tests
+
+// The writer: the exact bytes it makes, the escaping a reader undoes, and the mistakes it holds.
+
+private val MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+private val R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+// A small worksheet, written the way the abax `.xlsx` writer will write one.
+private sheet() -> XmlWriter
+    var w = writer()
+
+    w.declaration(Some(true))
+    w.open("worksheet")
+    w.ns("", MAIN)
+    w.ns("r", R)
+    w.open("sheetData")
+    w.open("row")
+    w.attr("r", "1")
+    w.open("c")
+    w.attr("r", "A1")
+    w.attr("t", "inlineStr")
+    w.open("is")
+    w.element("t", "Fish & chips <2>")
+    w.close()
+    w.close()
+    w.open("c")
+    w.attr("r", "B1")
+    w.element("v", "42")
+    w.close()
+    w.close()
+    w.close()
+    w.open("pageSetup")
+    w.attr("r:id", "rId1")
+    w.close()
+    w.close()
+    w
+end sheet
+
+private written(w: XmlWriter) -> string = w.finish().expect("writes")
+
+private mistake(w: XmlWriter) -> string
+    w.finish() match
+        Ok(t) -> s"written: $t"
+        Err(e) -> e.to_string()
+@test("a worksheet comes out as these exact bytes")
+exact_bytes()
+    assert_eq(written(sheet()),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" +
+        s"<worksheet xmlns=\"$MAIN\" xmlns:r=\"$R\"><sheetData><row r=\"1\">" +
+        "<c r=\"A1\" t=\"inlineStr\"><is><t>Fish &amp; chips &lt;2&gt;</t></is></c>" +
+        "<c r=\"B1\"><v>42</v></c></row></sheetData><pageSetup r:id=\"rId1\"/></worksheet>")
+end exact_bytes
+
+@test("the same calls make the same bytes")
+deterministic()
+    assert_eq(written(sheet()), written(sheet()))
+@test("what the writer makes, the reader reads back as the values that went in")
+round_trip()
+    val d = parse(written(sheet())).unwrap()
+    val c = d.root.child("sheetData").unwrap().child("row").unwrap().elements_named("c")
+
+    assert_eq(d.standalone, Some(true))
+    assert_eq(d.root.name.ns, MAIN)
+    assert_eq(c.at(0).text(), "Fish & chips <2>")
+    assert_eq(c.at(1).child("v").unwrap().text(), "42")
+    assert_eq(d.root.child("pageSetup").unwrap().attr_ns(R, "id"), Some("rId1"))
+end round_trip
+
+@test("text and attribute values with every character that needs escaping read back exactly")
+escaping_round_trip()
+    val nasty = "a&b<c>d\"e'f\tg\nh\ri\r\nj]]>k é 😀 &amp;"
+    var w = writer()
+
+    w.open("r")
+    w.attr("a", nasty)
+    w.text(nasty)
+    w.close()
+
+    val text = written(w)
+    val d = parse(text).unwrap()
+
+    assert_eq(d.root.attr("a"), Some(nasty))
+    assert_eq(d.root.text(), nasty)
+    assert_eq(text, "<r a=\"a&amp;b&lt;c&gt;d&quot;e'f&#9;g&#10;h&#13;i&#13;&#10;j]]&gt;k é 😀 &amp;amp;\">" +
+        "a&amp;b&lt;c&gt;d\"e'f\tg\nh&#13;i&#13;\nj]]&gt;k é 😀 &amp;amp;</r>")
+end escaping_round_trip
+
+@test("CDATA holding `]]>` is split across sections and reads back whole")
+cdata_split()
+    var w = writer()
+
+    w.open("r")
+    w.cdata("a]]>b]]>")
+    w.close()
+
+    val text = written(w)
+
+    assert_eq(text, "<r><![CDATA[a]]]]><![CDATA[>b]]]]><![CDATA[>]]></r>")
+    assert_eq(parse(text).unwrap().root.text(), "a]]>b]]>")
+end cdata_split
+
+@test("comments and processing instructions are written, and read back")
+comments_and_pis()
+    var w = writer()
+
+    w.comment(" before ")
+    w.pi("go", "")
+    w.open("r")
+    w.pi("p", "x y")
+    w.close()
+    w.comment("after")
+
+    val text = written(w)
+
+    assert_eq(text, "<!-- before --><?go?><r><?p x y?></r><!--after-->")
+    assert_eq(parse(text).unwrap().children.len(), 4)
+end comments_and_pis
+
+@test("a tree written out and read again is the same tree")
+tree_round_trip()
+    val text = "<?xml version=\"1.0\"?>\n<!--c--><a:r xmlns:a=\"u\" xmlns=\"d\" x=\"1\" a:y=\"&#9;\"><e/>t&amp;<![CDATA[<c>]]><?p d?><f xmlns=\"\">x</f></a:r>"
+    val d = parse(text).unwrap()
+    val again = parse(d.to_xml()).unwrap()
+
+    assert_eq(again.root, d.root)
+    assert_eq(again.children, d.children)
+    assert_eq(d.root.to_xml(), "<a:r xmlns:a=\"u\" xmlns=\"d\" x=\"1\" a:y=\"&#9;\"><e/>t&amp;<![CDATA[<c>]]><?p d?><f xmlns=\"\">x</f></a:r>")
+end tree_round_trip
+
+@test("two trees that differ anywhere are not equal")
+tree_inequality()
+    val base = parse("<r a='1'><x>t</x></r>").unwrap().root
+
+    assert_eq(parse("<r a='1'><x>t</x></r>").unwrap().root == base, true)
+    assert_eq(parse("<r a='2'><x>t</x></r>").unwrap().root == base, false)
+    assert_eq(parse("<r a='1'><x>u</x></r>").unwrap().root == base, false)
+    assert_eq(parse("<r a='1'><y>t</y></r>").unwrap().root == base, false)
+    assert_eq(parse("<r xmlns='n' a='1'><x>t</x></r>").unwrap().root == base, false)
+end tree_inequality
+
+@test("the writer's mistakes are held, and the first one is what `finish` answers")
+writer_mistakes()
+    var a = writer()
+
+    a.open("r")
+    a.text("x")
+    a.attr("late", "1")
+    a.attr("later", "2")
+    a.close()
+    assert_eq(mistake(a), "the attribute `late` comes after the element's content")
+
+    var b = writer()
+
+    b.open("1r")
+    assert_eq(mistake(b), "`1r` is not an element name")
+
+    var c = writer()
+
+    c.open("r")
+    c.close()
+    c.open("s")
+    assert_eq(mistake(c), "`<s>` would be a second root element")
+
+    var d = writer()
+
+    d.open("r")
+    d.open("s")
+    d.close()
+    assert_eq(mistake(d), "`<r>` is still open")
+
+    var e = writer()
+
+    e.close()
+    assert_eq(mistake(e), "`close` with no element open")
+
+    var f = writer()
+
+    f.open("r")
+    f.attr("xmlns:p", "u")
+    assert_eq(mistake(f), "`xmlns:p` is not an attribute name; a namespace is declared with `ns`")
+
+    var g = writer()
+
+    g.open("r")
+    g.text("a\u{0}b")
+    g.close()
+    assert_eq(mistake(g), "U+0000 cannot be written in XML")
+
+    var h = writer()
+
+    h.open("r")
+    h.attr("a", "\u{FFFF}")
+    h.close()
+    assert_eq(mistake(h), "U+FFFF cannot be written in XML")
+
+    var i = writer()
+
+    i.open("r")
+    i.close()
+    i.declaration()
+    assert_eq(mistake(i), "the XML declaration must come before everything else")
+
+    var j = writer()
+
+    j.text("x")
+    assert_eq(mistake(j), "text is only allowed inside the root element")
+
+    var k = writer()
+
+    k.open("r")
+    k.comment("a--b")
+    k.close()
+    assert_eq(mistake(k), "a comment may not hold `--` or end with `-`")
+
+    var l = writer()
+
+    l.open("r")
+    l.comment("a-")
+    l.close()
+    assert_eq(mistake(l), "a comment may not hold `--` or end with `-`")
+
+    var m = writer()
+
+    m.open("r")
+    m.pi("XML", "x")
+    m.close()
+    assert_eq(mistake(m), "`XML` is not a processing-instruction target")
+
+    var n = writer()
+
+    n.open("r")
+    n.pi("p", "a?>b")
+    n.close()
+    assert_eq(mistake(n), "a processing instruction may not hold `?>`")
+
+    var o = writer()
+
+    assert_eq(mistake(o), "a document needs a root element")
+
+    var p = writer()
+
+    p.open("a:b:c")
+    p.close()
+    assert_eq(mistake(p), "`a:b:c` is not an element name")
+
+    var q = writer()
+
+    q.open("r")
+    q.ns("x:y", "u")
+    q.close()
+    assert_eq(mistake(q), "`x:y` is not a namespace prefix")
+end writer_mistakes

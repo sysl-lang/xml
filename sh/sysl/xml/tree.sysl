@@ -6,7 +6,7 @@ import sysl.text.{from_utf8, str_builder, StrBuilder}
 // The tree: a whole document, read by the pull reader and hung on counted elements.
 
 // One child of an element, or of the document itself.
-enum Node
+enum Node derives Eq
     Elem(e: &Element)
     Text(text: string)
     CData(text: string)
@@ -14,7 +14,9 @@ enum Node
     Pi(target: string, data: string)
 end Node
 
-struct Element
+// An element. **Two compare equal when they are the same tree** -- names, attributes in order,
+// declarations, and children all the way down -- which is what a test of a round trip asks.
+struct Element derives Eq
     name: Name
     attrs: Buf[Attr]          // in document order, namespace declarations taken out
     decls: Buf[NsDecl]        // the `xmlns` and `xmlns:p` written on this element
@@ -113,7 +115,6 @@ struct Element
 
         write_element(&w, self)
         w.finish().expect("a tree the reader made is one the writer can write")
-    end to_xml
 end Element
 
 private gather_text(children: Buf[Node], b: *StrBuilder)
@@ -209,4 +210,3 @@ text_of(bytes: []const u8) -> Result[string, XmlError]
         Ok(t) -> Ok(t)
         Err(e) -> Err(fail_at(bytes[0..<e.offset], e.offset,
             "the document is not UTF-8 here; this reader takes UTF-8 only"))
-end text_of

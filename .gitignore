@@ -1,3 +1,7 @@
 target/
 .sysl/
 *.syslib
+
+# The W3C conformance suite, fetched by the tests: its licence does not allow it to be redistributed
+# in any form but the original archive.
+tests/w3c/
