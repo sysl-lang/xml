@@ -1,0 +1,212 @@
+module sh.sysl.xml
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8, str_builder, StrBuilder}
+
+// The tree: a whole document, read by the pull reader and hung on counted elements.
+
+// One child of an element, or of the document itself.
+enum Node
+    Elem(e: &Element)
+    Text(text: string)
+    CData(text: string)
+    Comment(text: string)
+    Pi(target: string, data: string)
+end Node
+
+struct Element
+    name: Name
+    attrs: Buf[Attr]          // in document order, namespace declarations taken out
+    decls: Buf[NsDecl]        // the `xmlns` and `xmlns:p` written on this element
+    children: Buf[Node]
+
+    // The local name, which is what a consumer of one vocabulary mostly asks.
+    local -> string = self.name.local
+
+    // An attribute's value by local name, whatever its namespace -- the first one, in document order.
+    // `attr("r")` on `<c r="B2">` is `Some("B2")`.
+    attr(self, local: string) -> Option[string]
+        for i in 0..<self.attrs.len()
+            val a = self.attrs.at(i)
+
+            if a.name.local == local then return Some(a.value)
+
+        None
+    end attr
+
+    // An attribute's value by namespace URI and local name -- `r:id` is `attr_ns(R, "id")` whatever
+    // prefix the document bound `R` to. "" is no namespace, so `attr_ns("", "id")` will not answer
+    // an `r:id`.
+    attr_ns(self, ns: string, local: string) -> Option[string]
+        for i in 0..<self.attrs.len()
+            val a = self.attrs.at(i)
+
+            if a.name.local == local && a.name.ns == ns then return Some(a.value)
+
+        None
+    end attr_ns
+
+    // The first child element with this local name.
+    child(self, local: string) -> Option[&Element]
+        for i in 0..<self.children.len()
+            self.children.at(i) match
+                Elem(e) -> if e.name.local == local then return Some(e)
+                _ -> ()
+
+        None
+    end child
+
+    // The first child element with this namespace and local name.
+    child_ns(self, ns: string, local: string) -> Option[&Element]
+        for i in 0..<self.children.len()
+            self.children.at(i) match
+                Elem(e) -> if e.name.is(ns, local) then return Some(e)
+                _ -> ()
+
+        None
+    end child_ns
+
+    // Every child element, in order -- the children without the text between them.
+    elements(self) -> Buf[&Element]
+        var out: Buf[&Element] = buf()
+
+        for i in 0..<self.children.len()
+            self.children.at(i) match
+                Elem(e) -> out.push(e)
+                _ -> ()
+
+        out
+    end elements
+
+    // Every child element with this local name, in order: `sheet_data.elements_named("row")`.
+    elements_named(self, local: string) -> Buf[&Element]
+        var out: Buf[&Element] = buf()
+
+        for i in 0..<self.children.len()
+            self.children.at(i) match
+                Elem(e) -> if e.name.local == local then out.push(e)
+                _ -> ()
+
+        out
+    end elements_named
+
+    // The text of this element and everything inside it, text and CDATA alike, in document order --
+    // what XPath calls the string value. Comments and processing instructions are not text.
+    text(self) -> string
+        // One child holding text is the usual case -- `<v>42</v>`, `<t>Total</t>` -- and it is the
+        // input's own slice, so it is handed back without a copy.
+        if self.children.len() == 1 then
+            self.children.at(0) match
+                Text(t) -> return t
+                CData(t) -> return t
+                _ -> ()
+
+        var b = str_builder()
+
+        gather_text(self.children, &b)
+        b.finish()
+    end text
+
+    // This element written out as XML, with no declaration -- what `Writer` would make of it.
+    to_xml(self) -> string
+        var w = writer()
+
+        write_element(&w, self)
+        w.finish().expect("a tree the reader made is one the writer can write")
+    end to_xml
+end Element
+
+private gather_text(children: Buf[Node], b: *StrBuilder)
+    for i in 0..<children.len()
+        children.at(i) match
+            Elem(c) -> gather_text(c.children, b)
+            Text(t) -> b.push(t)
+            CData(t) -> b.push(t)
+            _ -> ()
+end gather_text
+
+struct Document
+    // What the XML declaration said, or "" and `None` where there was none.
+    version: string
+    encoding: string
+    standalone: Option[bool]
+
+    // The name a DOCTYPE gave, or "". The rest of a DOCTYPE is not kept.
+    doctype: string
+
+    // The comments and processing instructions around the root element, and the root element itself,
+    // in order.
+    children: Buf[Node]
+    root: &Element
+
+    // The document written out as XML. The declaration is written where the document had one, and a
+    // DOCTYPE is not written at all.
+    to_xml(self) -> string
+        var w = writer()
+
+        if !self.version.is_empty() then w.declaration(self.standalone)
+
+        for i in 0..<self.children.len()
+            write_node(&w, self.children.at(i))
+
+        w.finish().expect("a tree the reader made is one the writer can write")
+    end to_xml
+end Document
+
+// A document from its text: every event of `reader(text)` hung on a tree, the first error stopping it.
+parse(text: string) -> Result[&Document, XmlError]
+    var r = reader(text)
+    var top: Buf[Node] = buf()
+    var stack: Buf[&Element] = buf()
+    var root: Option[&Element] = None
+    var doctype = ""
+
+    loop
+        val node = r.next()? match
+            Event.Start(name, attrs, decls) ->
+                val e: &Element = Element(name, attrs, decls, buf())
+
+                if stack.is_empty() then root = Some(e)
+
+                stack.push(e)
+                Node.Elem(e)
+            Event.End(_) ->
+                val e = stack.pop().expect("the reader matched this end tag to a start")
+
+                if !stack.is_empty() then continue
+
+                Node.Elem(e)
+            Event.Text(t) -> Node.Text(t)
+            Event.CData(t) -> Node.CData(t)
+            Event.Comment(t) -> Node.Comment(t)
+            Event.Pi(t, d) -> Node.Pi(t, d)
+            Event.Doctype(n) ->
+                doctype = n
+                continue
+            Event.Eof -> break
+
+        // An element is hung on its parent when it starts, and on the document when it ends -- the
+        // root is the one element with no parent, and it goes in after the prolog it followed.
+        if stack.is_empty() then
+            top.push(node)
+        else
+            node match
+                Elem(e) ->
+                    if stack.len() > 1 then stack.at(stack.len() - 2).children.push(Node.Elem(e))
+                _ -> stack.at(stack.len() - 1).children.push(node)
+
+    Ok(Document(r.version, r.encoding, r.standalone, doctype, top,
+        root.expect("the reader refuses a document with no root element")))
+end parse
+
+// A document from bytes: checked as UTF-8, a byte order mark dropped, and parsed.
+parse_bytes(bytes: []const u8) -> Result[&Document, XmlError] = parse(text_of(bytes)?)
+
+// Bytes as the text `parse` and `reader` take, or an error at the first byte that is not UTF-8.
+// This is the step a caller with a file's bytes -- an entry out of a ZIP archive -- takes first.
+text_of(bytes: []const u8) -> Result[string, XmlError]
+    from_utf8(bytes) match
+        Ok(t) -> Ok(t)
+        Err(e) -> Err(fail_at(bytes[0..<e.offset], e.offset,
+            "the document is not UTF-8 here; this reader takes UTF-8 only"))
+end text_of

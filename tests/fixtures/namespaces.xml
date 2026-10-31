@@ -1,0 +1,11 @@
+<root xmlns="urn:default" xmlns:a="urn:a" xmlns:b="urn:b">
+  <plain attr="no namespace" a:attr="in a" b:attr="in b"/>
+  <a:child a:x="1" xml:lang="en-GB">
+    <inner xmlns="urn:other">redefault</inner>
+    <undefault xmlns=""><leaf/></undefault>
+    <a:rebind xmlns:a="urn:a2"><a:deep a:y="2"/></a:rebind>
+    <a:back/>
+  </a:child>
+  <c:x xmlns:c="urn:c" c:y="z"/>
+  <q:same xmlns:q="urn:a" q:k="1" b:k="2"/>
+</root>

@@ -1,0 +1,168 @@
+module sh.sysl.xml
+
+import sysl.text.chars_of
+import sh.sysl.parsing.{ByteSet, byte_set_of, byte_range, source}
+
+// The names, the error, and the character classes every other file here is written against.
+
+// The namespace the `xml:` prefix is bound to in every document, without a declaration.
+val XML_NS = "http://www.w3.org/XML/1998/namespace"
+
+// The namespace a namespace declaration itself is in. No element or attribute may be put in it.
+val XMLNS_NS = "http://www.w3.org/2000/xmlns/"
+
+// An element's or an attribute's name, as written and as resolved.
+//
+// **`ns` is the URI the prefix was bound to where the name appeared**, which is what two documents
+// that spell the same namespace with different prefixes agree on -- OOXML's `r:id` and a writer's
+// `rel:id` are both `ns == "http://schemas.openxmlformats.org/officeDocument/2006/relationships"`
+// and `local == "id"`. An unprefixed attribute is in no namespace whatever the default is, as the
+// Namespaces recommendation says; an unprefixed element takes the default.
+struct Name derives Eq
+    qname: string      // as written: `x14ac:dyDescent`
+    prefix: string     // `x14ac`, or "" where there is none
+    local: string      // `dyDescent`
+    ns: string         // the URI, or "" for no namespace
+
+    // Whether this is `local` in namespace `ns` -- the test a consumer of a namespaced vocabulary
+    // writes, since the prefix is the document's choice and not the vocabulary's.
+    is(self, ns: string, local: string) -> bool = self.local == local && self.ns == ns
+end Name
+
+impl Display for Name
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.qname, out, fmt)
+
+// One attribute, its value with references replaced and whitespace normalised.
+struct Attr derives Eq
+    name: Name
+    value: string
+
+// One namespace declaration, `xmlns:prefix="uri"` -- or `xmlns="uri"`, where the prefix is "".
+//
+// **They are kept apart from the attributes** because they are not data: an element's `attr("r")`
+// must never answer the URI of an `xmlns:r` written beside it.
+struct NsDecl derives Eq
+    prefix: string
+    uri: string
+
+// What was wrong with a document, and where.
+//
+// The line and column are counted from 1, the column in characters rather than bytes, which is what
+// an editor's status bar says. `offset` is the byte the reader was at, for a caller that wants to
+// point into the text itself.
+struct XmlError derives Eq
+    line: usize
+    col: usize
+    offset: usize
+    message: string
+
+impl Display for XmlError
+    display(self, out: *Writer, fmt: FormatSpec) =
+        display_str(s"${self.line}:${self.col}: ${self.message}", out, fmt)
+
+// The error for a byte offset into `text`. The line table is built only here, so a document that
+// reads cleanly never pays for one.
+private[xml] fail_at(text: []const u8, offset: usize, message: string) -> XmlError
+    val loc = source("xml", text).locate(offset)
+
+    XmlError(loc.line, loc.col, offset, message)
+end fail_at
+
+// -- character classes ------------------------------------------------------------------------
+
+// `S`: the four whitespace characters XML has. Not `is_space`, which takes form feed and vertical
+// tab too, and XML does not.
+private[xml] val SPACE: ByteSet = byte_set_of(" \t\r\n")
+
+// The ASCII half of `NameStartChar` and `NameChar`. The rest is above 127 and is asked of the
+// decoded character, in `wide_name_start` and `wide_name_char`.
+private[xml] val NAME_START: ByteSet = byte_range(u8('a'), u8('z'))
+    .union(byte_range(u8('A'), u8('Z'))).with(u8('_')).with(u8(':'))
+
+private[xml] val NAME_CHAR: ByteSet = NAME_START.union(byte_range(u8('0'), u8('9')))
+    .with(u8('-')).with(u8('.'))
+
+// The C0 controls XML 1.0 refuses everywhere: all of them but tab, newline and carriage return.
+private[xml] val CONTROL: ByteSet = byte_range(0, 31).without(byte_set_of("\t\n\r"))
+
+// The lead byte of every character from U+F000 to U+FFFF, which is where the two non-characters
+// U+FFFE and U+FFFF are. A scan stops on it and looks at the two bytes after.
+private[xml] val LEAD_EF: u8 = 0xEF
+
+// Whether a character above ASCII may begin a name (XML 1.0, fifth edition, production [4]).
+private[xml] wide_name_start(c: u32) -> bool =
+    (c >= 0xC0 && c <= 0xD6) || (c >= 0xD8 && c <= 0xF6) || (c >= 0xF8 && c <= 0x2FF) ||
+        (c >= 0x370 && c <= 0x37D) || (c >= 0x37F && c <= 0x1FFF) || c == 0x200C || c == 0x200D ||
+        (c >= 0x2070 && c <= 0x218F) || (c >= 0x2C00 && c <= 0x2FEF) || (c >= 0x3001 && c <= 0xD7FF) ||
+        (c >= 0xF900 && c <= 0xFDCF) || (c >= 0xFDF0 && c <= 0xFFFD) || (c >= 0x10000 && c <= 0xEFFFF)
+
+// Whether a character above ASCII may continue one (production [4a]).
+private[xml] wide_name_char(c: u32) -> bool =
+    wide_name_start(c) || c == 0xB7 || (c >= 0x300 && c <= 0x36F) || c == 0x203F || c == 0x2040
+
+// Whether a code point is a `Char` (production [2]) -- what a character reference may name.
+private[xml] is_xml_char(c: ulong) -> bool =
+    c == 0x9 || c == 0xA || c == 0xD || (c >= 0x20 && c <= 0xD7FF) || (c >= 0xE000 && c <= 0xFFFD) ||
+        (c >= 0x10000 && c <= 0x10FFFF)
+
+// Whether the three bytes at `at` are U+FFFE or U+FFFF, the two non-characters a well-formed
+// `string` may hold and an XML document may not.
+private[xml] is_non_char(b: []const u8, at: usize) -> bool =
+    at + 2 < b.len && b[at] == LEAD_EF && b[at + 1] == 0xBF && (b[at + 2] == 0xBE || b[at + 2] == 0xBF)
+
+// Whether `text` is a `Name` -- what the writer asks of every name it is handed.
+private[xml] is_name(text: string) -> bool
+    if text.is_empty() then return false
+
+    var first = true
+
+    for c in chars_of(text.bytes)
+        val u = u32(c)
+        val ok = if u < 128 then
+            (if first then NAME_START else NAME_CHAR).has(u8(u))
+        else
+            if first then wide_name_start(u) else wide_name_char(u)
+
+        if !ok then return false
+
+        first = false
+
+    true
+end is_name
+
+// Whether `text` is an `NCName` -- a name with no colon, which is what a prefix and a local part are.
+private[xml] is_ncname(text: string) -> bool = is_name(text) && !has_colon(text)
+
+private[xml] has_colon(text: string) -> bool
+    for i in 0..<text.len
+        if text.bytes[i] == u8(':') then return true
+
+    false
+end has_colon
+
+// Whether `text` is a qualified name: one `NCName`, or two joined by a single colon.
+private[xml] is_qname(text: string) -> bool
+    if !is_name(text) then return false
+
+    split_qname(text) match
+        Some((p, l)) -> (p.is_empty() || is_ncname(p)) && is_ncname(l)
+        None -> false
+end is_qname
+
+// A qualified name's prefix and local part, or nothing where the colons are not the one that
+// Namespaces allows -- at the start, at the end, or more than one.
+private[xml] split_qname(q: string) -> Option[(string, string)]
+    var at = q.len
+
+    for i in 0..<q.len
+        if q.bytes[i] == u8(':') then
+            if at != q.len then return None
+
+            at = i
+
+    if at == q.len then return Some(("", q))
+
+    if at == 0 || at + 1 == q.len then return None
+
+    Some((q[0..<at], q[at + 1..]))
+end split_qname

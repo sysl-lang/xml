@@ -1,0 +1,286 @@
+module sh.sysl.xml
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{StrBuilder, str_builder, eq_fold}
+
+// The writer: a document built by calls, into text.
+//
+// **The same calls make the same bytes.** Nothing is indented or reordered, attributes come out in the
+// order they were added, and every quote is `"` -- so a file written twice is the same file, which is
+// what a test that compares against a fixture or a ZIP that is hashed needs.
+//
+// **A mistake is held, not thrown.** A name that is not a name, an attribute after content, a comment
+// holding `--`: the first one is remembered and `finish` answers it, so a writer is driven as a run of
+// plain calls and checked once at the end.
+
+// Why a document could not be written.
+struct WriteError derives Eq
+    message: string
+
+impl Display for WriteError
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message, out, fmt)
+
+writer() -> XmlWriter = XmlWriter(str_builder(), buf(), false, false, None)
+
+struct XmlWriter
+    out: StrBuilder
+    stack: Buf[string]     // the open elements' names, outermost first
+    in_tag: bool           // a start tag is open: its `>` is not written yet
+    wrote_root: bool
+    error: Option[WriteError]
+
+    // `<?xml version="1.0" encoding="UTF-8"?>` and a newline -- with `standalone` where one is given.
+    // It is only allowed first.
+    declaration(*self, standalone: Option[bool] = None)
+        if self.out.len > 0 then return self.refuse("the XML declaration must come before everything else")
+
+        self.out.push("<?xml version=\"1.0\" encoding=\"UTF-8\"")
+
+        standalone match
+            Some(yes) -> self.out.push(if yes then " standalone=\"yes\"" else " standalone=\"no\"")
+            None -> ()
+
+        self.out.push("?>\n")
+    end declaration
+
+    // `<name`: an element begins. Attributes and declarations may follow until its content does.
+    open(*self, name: string)
+        if !is_qname(name) then return self.refuse(s"`$name` is not an element name")
+
+        if self.stack.is_empty() then
+            if self.wrote_root then return self.refuse(s"`<$name>` would be a second root element")
+
+            self.wrote_root = true
+
+        self.end_start_tag()
+        self.out.push("<")
+        self.out.push(name)
+        self.stack.push(name)
+        self.in_tag = true
+    end open
+
+    // `name="value"` on the element just opened, its value escaped so that a reader reads back exactly
+    // `value` -- tabs and line ends included, as references.
+    attr(*self, name: string, value: string)
+        if !self.in_tag then return self.refuse(s"the attribute `$name` comes after the element's content")
+
+        if !is_qname(name) || name == "xmlns" || name.starts_with("xmlns:") then
+            return self.refuse(s"`$name` is not an attribute name; a namespace is declared with `ns`")
+
+        self.out.push(" ")
+        self.out.push(name)
+        self.out.push("=\"")
+        self.escaped(value, true)
+        self.out.push("\"")
+    end attr
+
+    // A namespace declaration on the element just opened: `xmlns:prefix="uri"`, or `xmlns="uri"`
+    // where `prefix` is "".
+    ns(*self, prefix: string, uri: string)
+        if !self.in_tag then return self.refuse(s"the declaration of `$prefix` comes after the element's content")
+
+        if !prefix.is_empty() && !is_ncname(prefix) then return self.refuse(s"`$prefix` is not a namespace prefix")
+
+        self.out.push(if prefix.is_empty() then " xmlns=\"" else " xmlns:")
+
+        if !prefix.is_empty() then
+            self.out.push(prefix)
+            self.out.push("=\"")
+
+        self.escaped(uri, true)
+        self.out.push("\"")
+    end ns
+
+    // Character data, escaped: `&`, `<` and `>` as references, and a carriage return as `&#13;` so
+    // that a reader does not turn it into a newline.
+    text(*self, text: string)
+        if !self.inside("text") then return
+
+        self.end_start_tag()
+        self.escaped(text, false)
+    end text
+
+    // A CDATA section. Text holding `]]>` is split across two sections, which reads back as the same
+    // text.
+    cdata(*self, text: string)
+        if !self.inside("a CDATA section") then return
+
+        if !self.legal(text) then return
+
+        self.end_start_tag()
+        self.out.push("<![CDATA[")
+
+        var from: usize = 0
+
+        loop
+            text[from..].index_of("]]>") match
+                Some(i) ->
+                    self.out.push(text[from..<from + i + 2])
+                    self.out.push("]]><![CDATA[")
+                    from += i + 2
+                None -> break
+
+        self.out.push(text[from..])
+        self.out.push("]]>")
+    end cdata
+
+    // `<!--text-->`. A comment may not hold `--` or end in `-`, and there is no escaping in one.
+    comment(*self, text: string)
+        if text.index_of("--").is_some() || text.ends_with("-") then
+            return self.refuse("a comment may not hold `--` or end with `-`")
+
+        if !self.legal(text) then return
+
+        self.end_start_tag()
+        self.out.push("<!--")
+        self.out.push(text)
+        self.out.push("-->")
+    end comment
+
+    // `<?target data?>`.
+    pi(*self, target: string, data: string)
+        if !is_ncname(target) || eq_fold(target, "xml") then
+            return self.refuse(s"`$target` is not a processing-instruction target")
+
+        if data.index_of("?>").is_some() then return self.refuse("a processing instruction may not hold `?>`")
+
+        if !self.legal(data) then return
+
+        self.end_start_tag()
+        self.out.push("<?")
+        self.out.push(target)
+
+        if !data.is_empty() then
+            self.out.push(" ")
+            self.out.push(data)
+
+        self.out.push("?>")
+    end pi
+
+    // The innermost element ends: `/>` if nothing was written inside it, else `</name>`.
+    close(*self)
+        val name = self.stack.pop() match
+            Some(n) -> n
+            None -> return self.refuse("`close` with no element open")
+
+        if self.in_tag then
+            self.out.push("/>")
+            self.in_tag = false
+        else
+            self.out.push("</")
+            self.out.push(name)
+            self.out.push(">")
+    end close
+
+    // `<name>text</name>`, the shape most of a spreadsheet's cells take.
+    element(*self, name: string, text: string)
+        self.open(name)
+        self.text(text)
+        self.close()
+    end element
+
+    // The document, or the first mistake made writing it. An element still open is a mistake.
+    finish(self) -> Result[string, WriteError]
+        self.error match
+            Some(e) -> return Err(e)
+            None -> ()
+
+        if !self.stack.is_empty() then
+            return Err(WriteError(s"`<${self.stack.at(self.stack.len() - 1)}>` is still open"))
+
+        if !self.wrote_root then return Err(WriteError("a document needs a root element"))
+
+        Ok(self.out.finish())
+    end finish
+
+    private refuse(*self, message: string)
+        if self.error.is_none() then self.error = Some(WriteError(message))
+
+    private inside(*self, what: string) -> bool
+        if self.stack.is_empty() then
+            self.refuse(s"$what is only allowed inside the root element")
+            return false
+
+        true
+    end inside
+
+    private end_start_tag(*self)
+        if self.in_tag then
+            self.out.push(">")
+            self.in_tag = false
+    end end_start_tag
+
+    // Whether `text` holds only characters XML allows; the first that it does not is the mistake.
+    private legal(*self, text: string) -> bool
+        for i in 0..<text.len
+            val c = text.bytes[i]
+
+            if CONTROL.has(c) || is_non_char(text.bytes, i) then
+                self.refuse(f"U+${if c == LEAD_EF then 0xFFC0 | (u32(text.bytes[i + 2]) & 0x3F) else u32(c)}%04X cannot be written in XML")
+                return false
+
+        true
+    end legal
+
+    // `text` with what has to be escaped escaped. In an attribute, `"` and the three whitespace
+    // characters a reader would normalise are references too.
+    private escaped(*self, text: string, attr: bool)
+        if !self.legal(text) then return
+
+        var seg: usize = 0
+
+        for i in 0..<text.len
+            val c = text.bytes[i]
+            val rep = if c == u8('&') then
+                "&amp;"
+            elif c == u8('<') then
+                "&lt;"
+            elif c == u8('>') then
+                "&gt;"
+            elif c == u8('\r') then
+                "&#13;"
+            elif attr && c == u8('"') then
+                "&quot;"
+            elif attr && c == u8('\n') then
+                "&#10;"
+            elif attr && c == u8('\t') then
+                "&#9;"
+            else
+                ""
+
+            if !rep.is_empty() then
+                self.out.bytes.extend(text.bytes[seg..<i])
+                self.out.push(rep)
+                seg = i + 1
+
+        self.out.bytes.extend(text.bytes[seg..<text.len])
+    end escaped
+end XmlWriter
+
+private[xml] write_node(w: *XmlWriter, n: Node)
+    n match
+        Elem(e) -> write_element(w, e)
+        Text(t) -> w.text(t)
+        CData(t) -> w.cdata(t)
+        Comment(t) -> w.comment(t)
+        Pi(t, d) -> w.pi(t, d)
+end write_node
+
+private[xml] write_element(w: *XmlWriter, e: &Element)
+    w.open(e.name.qname)
+
+    for i in 0..<e.decls.len()
+        val d = e.decls.at(i)
+
+        w.ns(d.prefix, d.uri)
+
+    for i in 0..<e.attrs.len()
+        val a = e.attrs.at(i)
+
+        w.attr(a.name.qname, a.value)
+
+    for i in 0..<e.children.len()
+        write_node(w, e.children.at(i))
+
+    w.close()
+end write_element

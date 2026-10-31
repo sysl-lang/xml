@@ -1,0 +1,200 @@
+module sh.sysl.xml
+
+@tests
+
+// The oracle: every fixture under `tests/fixtures/` is read here and by Python's expat
+// (`tests/oracle.py`), and the two readings are compared line by line -- element names resolved to
+// their namespace URIs, every attribute value after normalisation, every namespace declaration, the
+// text with references replaced and line ends normalised, comments and processing instructions.
+// Values, not accept-or-refuse.
+//
+// The fixtures are the five parts of an `.xlsx` this package is first for -- `[Content_Types].xml`,
+// `workbook.xml`, a worksheet, the shared strings and the styles, as Excel writes them -- and three
+// written to reach the corners: a prolog with a DOCTYPE and an internal subset, every reference form,
+// CDATA, names above ASCII (`misc.xml`); default, prefixed, rebound and undeclared namespaces
+// (`namespaces.xml`); and carriage returns in text, attributes, comments, CDATA and a processing
+// instruction (`crlf.xml`).
+//
+// **Both of this package's readers are compared**: the tree, walked, and the pull reader's events as
+// they come. The suite needs `python3` on the path.
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{read_bytes, entries}
+import sysl.process.capture
+import sysl.text.{str_builder, StrBuilder}
+
+private[xml] fixtures_dir() -> string
+    val here = __FILE__
+    val cut = here.last_index_of("/sh/sysl/xml/").expect("this file sits under sh/sysl/xml")
+
+    s"${here[0..<cut]}/tests"
+end fixtures_dir
+
+private[xml] fixture(name: string) -> string =
+    text_of(read_bytes(s"${fixtures_dir()}/fixtures/$name").unwrap()).unwrap()
+
+// `text` with a backslash, a newline, a carriage return and a tab written as escapes, so that a line
+// of the dump is a line.
+private[xml] esc(text: string) -> string
+    var b = str_builder()
+
+    for i in 0..<text.len
+        val c = text.bytes[i]
+
+        if c == u8('\\') then
+            b.push("\\\\")
+        elif c == u8('\n') then
+            b.push("\\n")
+        elif c == u8('\r') then
+            b.push("\\r")
+        elif c == u8('\t') then
+            b.push("\\t")
+        else
+            b.bytes.push(c)
+
+    b.finish()
+end esc
+
+private[xml] expanded(n: Name) -> string = if n.ns.is_empty() then n.local else s"{${n.ns}}${n.local}"
+
+// The dump `tests/oracle.py` makes, built from events. Adjacent text and CDATA are one line, as expat
+// hands them over in pieces and the oracle joins them.
+private[xml] struct Dump
+    out: StrBuilder
+    text: StrBuilder
+    pending: bool
+
+    line(*self, s: string)
+        self.flush()
+        self.out.push(s)
+        self.out.push("\n")
+    end line
+
+    chars(*self, t: string)
+        self.text.push(t)
+        self.pending = true
+
+    flush(*self)
+        if self.pending then
+            self.out.push("T ")
+            self.out.push(esc(self.text.finish()))
+            self.out.push("\n")
+            self.text.clear()
+            self.pending = false
+    end flush
+
+    start(*self, name: Name, attrs: Buf[Attr], decls: Buf[NsDecl])
+        self.line(s"S ${expanded(name)}")
+
+        for i in 0..<decls.len()
+            self.line(s"N ${decls.at(i).prefix} ${esc(decls.at(i).uri)}")
+
+        for i in 0..<attrs.len()
+            self.line(s"A ${expanded(attrs.at(i).name)} ${esc(attrs.at(i).value)}")
+    end start
+
+    finish(*self) -> string
+        self.flush()
+        self.out.finish()
+    end finish
+end Dump
+
+private[xml] dump() -> Dump = Dump(str_builder(), str_builder(), false)
+
+// The pull reader's reading of `text`, as the dump.
+private[xml] dump_events(text: string) -> string
+    var r = reader(text)
+    var d = dump()
+
+    loop
+        r.next() match
+            Err(_) -> return "ERROR\n"
+            Ok(e) -> e match
+                Start(n, a, ds) -> d.start(n, a, ds)
+                End(n) -> d.line(s"E ${expanded(n)}")
+                Event.Text(t) -> d.chars(t)
+                Event.CData(t) -> d.chars(t)
+                Event.Comment(t) -> d.line(s"C ${esc(t)}")
+                Event.Pi(t, data) -> d.line(s"P $t ${esc(data)}")
+                Doctype(_) -> ()
+                Eof -> break
+
+    d.finish()
+end dump_events
+
+private dump_nodes(d: *Dump, nodes: Buf[Node])
+    for i in 0..<nodes.len()
+        nodes.at(i) match
+            Elem(e) ->
+                d.start(e.name, e.attrs, e.decls)
+                dump_nodes(d, e.children)
+                d.line(s"E ${expanded(e.name)}")
+            Node.Text(t) -> d.chars(t)
+            Node.CData(t) -> d.chars(t)
+            Node.Comment(t) -> d.line(s"C ${esc(t)}")
+            Node.Pi(t, data) -> d.line(s"P $t ${esc(data)}")
+end dump_nodes
+
+// The tree's reading of `text`, as the dump.
+private[xml] dump_tree(text: string) -> string
+    parse(text) match
+        Err(_) -> "ERROR\n"
+        Ok(doc) ->
+            var d = dump()
+
+            dump_nodes(&d, doc.children)
+            d.finish()
+end dump_tree
+
+// What expat makes of a file.
+private[xml] expat(file: string) -> string =
+    capture("python3", ["-I", s"${fixtures_dir()}/oracle.py", file]).unwrap().text
+
+private[xml] fixture_names() -> Buf[string]
+    var out: Buf[string] = buf()
+    val all = entries(s"${fixtures_dir()}/fixtures").unwrap()
+
+    for i in 0..<all.len()
+        if all.at(i).ends_with(".xml") then out.push(all.at(i))
+
+    out
+end fixture_names
+
+@test("every fixture reads, as a tree, exactly as expat reads it")
+tree_matches_expat()
+    val names = fixture_names()
+
+    assert(names.len() >= 8, "the fixtures are found")
+
+    for i in 0..<names.len()
+        val name = names.at(i)
+        val want = expat(s"${fixtures_dir()}/fixtures/$name")
+
+        assert(want != "ERROR\n" && want.len > 0, s"expat reads $name")
+        assert_eq(dump_tree(fixture(name)), want, name)
+end tree_matches_expat
+
+@test("every fixture reads, as events, exactly as expat reads it")
+events_match_expat()
+    val names = fixture_names()
+
+    for i in 0..<names.len()
+        val name = names.at(i)
+
+        assert_eq(dump_events(fixture(name)), expat(s"${fixtures_dir()}/fixtures/$name"), name)
+end events_match_expat
+
+@test("a document written from a fixture's tree reads back as the same document")
+fixtures_round_trip()
+    val names = fixture_names()
+
+    for i in 0..<names.len()
+        val name = names.at(i)
+        val text = fixture(name)
+        val again = parse(text).unwrap().to_xml()
+
+        assert_eq(dump_tree(again), dump_tree(text), name)
+
+        // Writing is a fixed point: the second writing is the first, byte for byte.
+        assert_eq(parse(again).unwrap().to_xml(), again, name)
+end fixtures_round_trip

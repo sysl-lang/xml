@@ -1,0 +1,802 @@
+module sh.sysl.xml
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{StrBuilder, str_builder, char_from_u32, eq_fold}
+import sh.sysl.parsing.{Scanner, scanner, ByteSet, byte_set_of, Span, source, found_at, read_digits}
+
+// The pull reader: one document, handed out one event at a time.
+//
+// **It is the only tokenizer in the package.** `parse` is a loop over these events that hangs them on
+// a tree, so a document the tree accepts is exactly a document the reader accepts, with the same
+// error at the same place.
+//
+// **Well-formedness is checked as the events go by, not afterwards.** An end tag that does not match
+// is refused when it is read; an element left open is refused at the end of the input. A caller that
+// stops early -- it found the sheet dimension and wants nothing else -- has been handed only events
+// that were correct as far as they went.
+//
+// **Text is a slice of the input wherever it can be.** A run of character data, an attribute value, a
+// comment that held no reference and no carriage return is the input's own bytes, shared rather than
+// copied; only text that had something replaced in it is built afresh. For spreadsheet XML, where a
+// cell is `<c r="B2" s="1"><v>42</v></c>`, that is nearly all of it.
+
+// One step through a document.
+//
+// **An empty-element tag is a `Start` followed by an `End`**, so a consumer has one shape to handle
+// whichever way the document spelled an empty element.
+enum Event
+    // A start tag, with its attributes (namespace declarations taken out) and the declarations
+    // themselves. Names are resolved: `name.ns` and each attribute's `name.ns` are URIs.
+    Start(name: Name, attrs: Buf[Attr], decls: Buf[NsDecl])
+    End(name: Name)
+    // Character data, with references replaced and line ends normalised to `\n`. Whitespace between
+    // elements is text too: XML says so, and a consumer that does not want it skips it.
+    Text(text: string)
+    CData(text: string)
+    Comment(text: string)
+    Pi(target: string, data: string)
+    // A DOCTYPE was here; its name is the root element it names. Nothing in it is acted on.
+    Doctype(name: string)
+    // The end of the document, after its root element. Asked again, it answers this again.
+    Eof
+end Event
+
+impl Display for Event
+    display(self, out: *Writer, fmt: FormatSpec)
+        val text = self match
+            Start(n, _, _) -> s"<$n>"
+            End(n) -> s"</$n>"
+            Text(t) -> s"text `$t`"
+            CData(t) -> s"CDATA `$t`"
+            Comment(t) -> s"comment `$t`"
+            Pi(t, d) -> s"<?$t $d?>"
+            Doctype(n) -> s"DOCTYPE $n"
+            Eof -> "the end of the document"
+
+        display_str(text, out, fmt)
+    end display
+
+// What a character reference may be written with -- the scan of a text run stops on each of these.
+private val TEXT_STOP: ByteSet = CONTROL.union(byte_set_of("<&\r]")).with(LEAD_EF)
+
+private val ATTR_STOP: ByteSet = CONTROL.union(byte_set_of("<&\t\n\r")).with(LEAD_EF)
+private val ATTR_STOP_DQ: ByteSet = ATTR_STOP.with(u8('"'))
+private val ATTR_STOP_SQ: ByteSet = ATTR_STOP.with(u8('\''))
+
+// A comment, a CDATA section and a processing instruction: no references, but line ends and the
+// characters XML refuses still matter. The first byte of the closing delimiter is added per call.
+private val RAW_STOP: ByteSet = CONTROL.with(u8('\r')).with(LEAD_EF)
+
+// The UTF-8 byte order mark, which a document may begin with and which is not part of it.
+private val BOM: [3]u8 = [0xEF, 0xBB, 0xBF]
+
+// A reader over `text`, ready for its first `next`.
+reader(text: string) -> Reader =
+    Reader(text, scanner(text.bytes), buf(), buf(), buf(), buf(), buf(), str_builder(), false,
+        false, false, false, false, false, false, "", "", None)
+
+struct Reader
+    text: string
+    s: Scanner
+
+    // The open elements, outermost first, and the offset of each one's `<`.
+    open: Buf[Name]
+    opened: Buf[usize]
+
+    // Every namespace declaration in scope, innermost last, and how many there were when each open
+    // element began -- so closing one is a truncation.
+    scopes: Buf[NsDecl]
+    marks: Buf[usize]
+
+    // Where each attribute of the start tag being read began, for a duplicate's message.
+    attr_at: Buf[usize]
+
+    // Text that had something replaced in it is gathered here. It is one builder for the life of the
+    // reader, cleared per use: `finish` copies, so what it hands out does not see the next use.
+    sb: StrBuilder
+    copying: bool
+
+    started: bool
+    seen_root: bool
+    seen_doctype: bool
+    entity_decls: bool
+    pending_end: bool
+    done: bool
+
+    // What the XML declaration said, or "" and `None` where there was none.
+    version: string
+    encoding: string
+    standalone: Option[bool]
+
+    // How deep the reader is: 0 outside the root element, 1 directly inside it.
+    depth -> usize = self.open.len()
+
+    // The next event, or why the document stops being well-formed here.
+    next(*self) -> Result[Event, XmlError]
+        if self.pending_end then
+            self.pending_end = false
+            return Ok(End(self.close()))
+
+        if !self.started then
+            self.started = true
+            self.prologue()?
+
+        if self.open.is_empty() then return self.outside()
+
+        self.s.peek() match
+            None ->
+                val n = self.open.len() - 1
+
+                Err(self.fail(self.s.offset,
+                    s"the input ended inside `<${self.open.at(n)}>`, opened at ${self.loc(self.opened.at(n))}"))
+            Some(c) -> if c == u8('<') then self.markup() else self.chars()
+    end next
+
+    // -- errors -----------------------------------------------------------------------------------
+
+    private fail(self, at: usize, message: string) -> XmlError = fail_at(self.text.bytes, at, message)
+
+    private loc(self, at: usize) -> string = source("xml", self.text.bytes).locate(at).to_string()
+
+    // "expected X, found Y", with Y the character at `at` or the end of the input.
+    private expected(self, at: usize, want: string) -> XmlError
+        val src = source("xml", self.text.bytes)
+        var end = at + 1
+
+        while end < self.text.len && (self.text.bytes[end] & 0xC0) == 0x80
+            end += 1
+
+        fail_at(self.text.bytes, at, s"expected $want, found ${found_at(src, Span(at, end))}")
+    end expected
+
+    // -- the document around the root element --------------------------------------------------
+
+    // A byte order mark, then the XML declaration if the document opens with one. Nothing else may
+    // come before the declaration -- not even whitespace.
+    private prologue(*self) -> Result[unit, XmlError]
+        if self.s.starts_with(BOM[..]) then self.s.skip(3)
+
+        if self.s.starts_with("<?xml".bytes) then
+            self.s.peek_at(5) match
+                Some(c) -> if SPACE.has(c) then self.declaration()?
+                None -> ()
+
+        Ok(())
+    end prologue
+
+    // Between the events of the prolog and after the root element: whitespace is skipped, and
+    // anything that is not markup is refused.
+    private outside(*self) -> Result[Event, XmlError]
+        if self.done then return Ok(Eof)
+
+        self.s.accept_while_set(SPACE)
+
+        self.s.peek() match
+            None ->
+                if !self.seen_root then
+                    return Err(self.expected(self.s.offset, "the root element"))
+
+                self.done = true
+                Ok(Eof)
+            Some(c) ->
+                if c == u8('<') then return self.markup()
+
+                val where = if self.seen_root then "after the root element" else "before the root element"
+
+                Err(self.fail(self.s.offset, s"text is not allowed $where; a document's text is inside its root element"))
+    end outside
+
+    // Whatever begins with `<`.
+    private markup(*self) -> Result[Event, XmlError]
+        val at = self.s.offset
+
+        if self.s.accept_seq("<?".bytes) then return self.pi(at)
+
+        if self.s.accept_seq("<!--".bytes) then
+            return Ok(Comment(self.raw_until("-->".bytes, "comment", at)?))
+
+        if self.s.accept_seq("<![CDATA[".bytes) then
+            if self.open.is_empty() then
+                return Err(self.fail(at, "a CDATA section is not allowed outside the root element"))
+
+            return Ok(CData(self.raw_until("]]>".bytes, "CDATA section", at)?))
+
+        if self.s.accept_seq("<!DOCTYPE".bytes) then return self.doctype(at)
+
+        if self.s.starts_with("<!".bytes) then
+            return Err(self.fail(at, "expected `<!--`, `<![CDATA[` or `<!DOCTYPE` after `<!`"))
+
+        if self.s.accept_seq("</".bytes) then return self.end_tag(at)
+
+        self.s.bump()
+        self.start_tag(at)
+    end markup
+
+    // `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`, in that order, the last two optional.
+    private declaration(*self) -> Result[unit, XmlError]
+        val at = self.s.offset
+
+        self.s.skip(5)
+        self.s.accept_while_set(SPACE)
+
+        val version = self.decl_value("version", at)?
+
+        if !is_version(version) then
+            return Err(self.fail(at, s"`$version` is not an XML 1.x version number"))
+
+        self.version = version
+
+        var ws = self.s.accept_while_set(SPACE)
+
+        if self.s.starts_with("encoding".bytes) then
+            if ws == 0 then return Err(self.expected(self.s.offset, "whitespace before `encoding`"))
+
+            val m = self.s.offset
+            val enc = self.decl_value("encoding", at)?
+
+            if !eq_fold(enc, "UTF-8") && !eq_fold(enc, "UTF8") && !eq_fold(enc, "US-ASCII") then
+                return Err(self.fail(m, s"the encoding `$enc` is not supported; this reader takes UTF-8 (and US-ASCII, which is part of it)"))
+
+            self.encoding = enc
+            ws = self.s.accept_while_set(SPACE)
+
+        if self.s.starts_with("standalone".bytes) then
+            if ws == 0 then return Err(self.expected(self.s.offset, "whitespace before `standalone`"))
+
+            val m = self.s.offset
+            val sd = self.decl_value("standalone", at)?
+
+            self.standalone = if sd == "yes" then
+                Some(true)
+            elif sd == "no" then
+                Some(false)
+            else
+                return Err(self.fail(m, s"`standalone` is `yes` or `no`, not `$sd`"))
+
+            self.s.accept_while_set(SPACE)
+
+        if !self.s.accept_seq("?>".bytes) then
+            return Err(self.expected(self.s.offset, "`?>` to end the XML declaration"))
+
+        Ok(())
+    end declaration
+
+    // `name = "value"` inside the declaration. The value is the bytes between the quotes, since none
+    // of the three may hold a reference.
+    private decl_value(*self, name: string, decl_at: usize) -> Result[string, XmlError]
+        if !self.s.accept_seq(name.bytes) then
+            return Err(self.expected(self.s.offset, s"`$name` in the XML declaration at ${self.loc(decl_at)}"))
+
+        self.s.accept_while_set(SPACE)
+
+        if !self.s.accept(u8('=')) then return Err(self.expected(self.s.offset, s"`=` after `$name`"))
+
+        self.s.accept_while_set(SPACE)
+
+        val q = self.s.peek().unwrap_or(0)
+
+        if q != u8('"') && q != u8('\'') then return Err(self.expected(self.s.offset, s"a quoted value for `$name`"))
+
+        self.s.bump()
+
+        val start = self.s.offset
+
+        self.s.find(q) match
+            Some(end) ->
+                self.s.skip(end - start + 1)
+                Ok(self.text[start..<end])
+            None -> Err(self.fail(start - 1, s"the value of `$name` is not closed"))
+    end decl_value
+
+    // `<!DOCTYPE root ...>`, which is skipped: its quoted literals, and an internal subset with its
+    // own comments and processing instructions, are stepped over so that a `>` inside one of them
+    // does not end it early.
+    private doctype(*self, at: usize) -> Result[Event, XmlError]
+        if self.seen_root || !self.open.is_empty() then
+            return Err(self.fail(at, "a DOCTYPE is only allowed before the root element"))
+
+        if self.seen_doctype then return Err(self.fail(at, "a document has at most one DOCTYPE"))
+
+        self.seen_doctype = true
+
+        if self.s.accept_while_set(SPACE) == 0 then
+            return Err(self.expected(self.s.offset, "whitespace after `<!DOCTYPE`"))
+
+        val name = self.read_name("the root element's name")?
+        var subset = false
+
+        loop
+            val c = self.s.peek() match
+                Some(c) -> c
+                None -> return Err(self.fail(at, "the DOCTYPE is not closed; the input ended inside it"))
+
+            if c == u8('"') || c == u8('\'') then
+                self.s.bump()
+
+                self.s.find(c) match
+                    Some(end) -> self.s.skip(end - self.s.offset + 1)
+                    None -> return Err(self.fail(at, "a quoted literal in the DOCTYPE is not closed"))
+            elif subset && self.s.accept_seq("<!--".bytes) then
+                self.raw_until("-->".bytes, "comment", at)?
+            elif subset && self.s.accept_seq("<?".bytes) then
+                self.raw_until("?>".bytes, "processing instruction", at)?
+            elif subset && self.s.starts_with("<!ENTITY".bytes) then
+                self.entity_decls = true
+                self.s.bump()
+            elif !subset && c == u8('[') then
+                subset = true
+                self.s.bump()
+            elif subset && c == u8(']') then
+                subset = false
+                self.s.bump()
+            elif !subset && c == u8('>') then
+                self.s.bump()
+                return Ok(Doctype(self.text[name.start..<name.end]))
+            else
+                self.s.bump()
+    end doctype
+
+    // -- tags ---------------------------------------------------------------------------------------
+
+    private start_tag(*self, at: usize) -> Result[Event, XmlError]
+        if self.open.is_empty() then
+            if self.seen_root then
+                return Err(self.fail(at, "a second root element; a document has exactly one"))
+
+            self.seen_root = true
+
+        val qspan = self.read_name("an element name after `<`")?
+        val qname = self.text[qspan.start..<qspan.end]
+        var attrs: Buf[Attr] = buf()
+        var decls: Buf[NsDecl] = buf()
+
+        self.attr_at.clear()
+
+        var empty = false
+
+        loop
+            val ws = self.s.accept_while_set(SPACE)
+
+            if self.s.accept_seq("/>".bytes) then
+                empty = true
+                break
+
+            if self.s.accept(u8('>')) then break
+
+            if self.s.at_end() then
+                return Err(self.fail(at, s"the input ended inside the start tag `<$qname`"))
+
+            if ws == 0 then return Err(self.expected(self.s.offset, "whitespace, `>` or `/>`"))
+
+            val an_at = self.s.offset
+            val an = self.read_name("an attribute name, `>` or `/>`")?
+            val aq = self.text[an.start..<an.end]
+
+            self.s.accept_while_set(SPACE)
+
+            if !self.s.accept(u8('=')) then
+                return Err(self.expected(self.s.offset, s"`=` after the attribute name `$aq`"))
+
+            self.s.accept_while_set(SPACE)
+
+            val value = self.attr_value()?
+
+            for i in 0..<attrs.len()
+                if attrs.at(i).name.qname == aq then
+                    return Err(self.fail(an_at, s"the attribute `$aq` is given twice in one start tag"))
+
+            if aq == "xmlns" || (aq.len > 6 && aq.bytes[5] == u8(':') && aq.starts_with("xmlns:")) then
+                val prefix = if aq.len == 5 then "" else aq[6..]
+
+                for i in 0..<decls.len()
+                    if decls.at(i).prefix == prefix then
+                        return Err(self.fail(an_at, s"the attribute `$aq` is given twice in one start tag"))
+
+                self.check_decl(an_at, prefix, value)?
+                decls.push(NsDecl(prefix, value))
+            else
+                val (prefix, local) = self.split(an_at, aq)?
+
+                attrs.push(Attr(Name(aq, prefix, local, ""), value))
+                self.attr_at.push(an_at)
+
+        self.marks.push(self.scopes.len())
+
+        for i in 0..<decls.len()
+            self.scopes.push(decls.at(i))
+
+        val (prefix, local) = self.split(at + 1, qname)?
+        val ns = self.resolve(at + 1, prefix, true)?
+        val name = Name(qname, prefix, local, ns)
+
+        for i in 0..<attrs.len()
+            var a = attrs.at(i)
+
+            if !a.name.prefix.is_empty() then
+                a.name.ns = self.resolve(self.attr_at.at(i), a.name.prefix, false)?
+                attrs.set(i, a)
+
+                for j in 0..<i
+                    val b = attrs.at(j)
+
+                    if b.name.local == a.name.local && b.name.ns == a.name.ns then
+                        return Err(self.fail(self.attr_at.at(i),
+                            s"`${a.name.qname}` and `${b.name.qname}` are the same attribute: both are `${a.name.local}` in `${a.name.ns}`"))
+
+        self.open.push(name)
+        self.opened.push(at)
+        self.pending_end = empty
+
+        Ok(Start(name, attrs, decls))
+    end start_tag
+
+    private end_tag(*self, at: usize) -> Result[Event, XmlError]
+        val qspan = self.read_name("an element name after `</`")?
+        val qname = self.text[qspan.start..<qspan.end]
+
+        self.s.accept_while_set(SPACE)
+
+        if !self.s.accept(u8('>')) then return Err(self.expected(self.s.offset, s"`>` to end `</$qname`"))
+
+        if self.open.is_empty() then
+            return Err(self.fail(at, s"`</$qname>` closes an element that was never opened"))
+
+        val n = self.open.len() - 1
+        val want = self.open.at(n).qname
+
+        if want != qname then
+            return Err(self.fail(at, s"`</$qname>` does not close `<$want>`, opened at ${self.loc(self.opened.at(n))}"))
+
+        Ok(End(self.close()))
+    end end_tag
+
+    // The innermost element, closed: its name, with the declarations it made gone out of scope.
+    private close(*self) -> Name
+        self.opened.pop()
+        self.scopes.truncate(self.marks.pop().unwrap_or(0))
+        self.open.pop().expect("an element is open when one is closed")
+    end close
+
+    // -- namespaces ---------------------------------------------------------------------------------
+
+    // A qualified name's two halves, or the error Namespaces gives for a name that is not one.
+    private split(self, at: usize, q: string) -> Result[(string, string), XmlError]
+        split_qname(q) match
+            Some((p, l)) ->
+                if (p.is_empty() || is_ncname(p)) && is_ncname(l) then return Ok((p, l))
+
+                Err(self.fail(at, s"`$q` is not a qualified name: the part after the colon must begin a name"))
+            None -> Err(self.fail(at, s"`$q` is not a qualified name: a name holds at most one colon, between a prefix and a local part"))
+    end split
+
+    // What `xmlns:prefix="uri"` may say. These are the Namespaces recommendation's constraints.
+    private check_decl(self, at: usize, prefix: string, uri: string) -> Result[unit, XmlError]
+        if prefix == "xmlns" then return Err(self.fail(at, "the prefix `xmlns` is bound already and may not be declared"))
+
+        if prefix == "xml" && uri != XML_NS then
+            return Err(self.fail(at, s"the prefix `xml` may only be bound to `$XML_NS`"))
+
+        if prefix != "xml" && uri == XML_NS then
+            return Err(self.fail(at, s"only the prefix `xml` may be bound to `$XML_NS`"))
+
+        if uri == XMLNS_NS then return Err(self.fail(at, s"no prefix may be bound to `$XMLNS_NS`"))
+
+        if !prefix.is_empty() && uri.is_empty() then
+            return Err(self.fail(at, s"`xmlns:$prefix=\"\"` cannot undeclare a prefix in XML 1.0"))
+
+        if !prefix.is_empty() && !is_ncname(prefix) then
+            return Err(self.fail(at, s"`$prefix` is not a namespace prefix: a prefix is a name with no colon"))
+
+        Ok(())
+    end check_decl
+
+    // The URI a prefix is bound to here. An unprefixed element takes the default namespace; an
+    // unprefixed attribute is in none.
+    private resolve(self, at: usize, prefix: string, element: bool) -> Result[string, XmlError]
+        if prefix.is_empty() && !element then return Ok("")
+
+        if prefix == "xml" then return Ok(XML_NS)
+
+        if prefix == "xmlns" then
+            return Err(self.fail(at, "the prefix `xmlns` is reserved for namespace declarations"))
+
+        var i = self.scopes.len()
+
+        while i > 0
+            i -= 1
+
+            val d = self.scopes.at(i)
+
+            if d.prefix == prefix then return Ok(d.uri)
+
+        if prefix.is_empty() then Ok("") else Err(self.fail(at, s"the namespace prefix `$prefix` is not declared"))
+    end resolve
+
+    // -- names --------------------------------------------------------------------------------------
+
+    // A `Name` at the cursor, or "expected `what`". ASCII is classified by table; a character above
+    // it is decoded and asked of the ranges, which is the uncommon path.
+    private read_name(*self, what: string) -> Result[Span, XmlError]
+        val m = self.s.offset
+
+        if !self.name_char(true) then return Err(self.expected(m, what))
+
+        while self.name_char(false)
+            ()
+
+        Ok(self.s.span_from(m))
+    end read_name
+
+    private name_char(*self, first: bool) -> bool
+        val c = self.s.peek() match
+            Some(c) -> c
+            None -> return false
+
+        if c < 128 then
+            if !(if first then NAME_START else NAME_CHAR).has(c) then return false
+
+            self.s.bump()
+            return true
+
+        self.s.peek_char() match
+            Some(ch) ->
+                val u = u32(ch)
+
+                if (first && wide_name_start(u)) || (!first && wide_name_char(u)) then
+                    self.s.next_char()
+                    true
+                else
+                    false
+            None -> false
+    end name_char
+
+    // -- character data -----------------------------------------------------------------------------
+
+    // Start copying, if not already: the builder takes everything from `seg` to the cursor.
+    private flush(*self, seg: usize)
+        if !self.copying then
+            self.sb.clear()
+            self.copying = true
+
+        self.sb.bytes.extend(self.text.bytes[seg..<self.s.offset])
+    end flush
+
+    // What a run gathered from `start`: the input itself if nothing was replaced, else the builder.
+    private gathered(*self, start: usize, seg: usize) -> string
+        if !self.copying then return self.text[start..<self.s.offset]
+
+        self.flush(seg)
+        self.copying = false
+        self.sb.finish()
+    end gathered
+
+    // A control character, or U+FFFE or U+FFFF, at the cursor: refused. Anything else the scan
+    // stopped on with `LEAD_EF` is an ordinary character and is stepped over.
+    private odd_byte(*self) -> Result[unit, XmlError]
+        val at = self.s.offset
+        val c = self.text.bytes[at]
+
+        if c == LEAD_EF then
+            if is_non_char(self.text.bytes, at) then
+                return Err(self.fail(at, f"U+${0xFFC0 | (u32(self.text.bytes[at + 2]) & 0x3F)}%04X is not a character XML allows"))
+
+            self.s.bump()
+            return Ok(())
+
+        Err(self.fail(at, f"the control character U+${c}%04X is not allowed in XML"))
+    end odd_byte
+
+    // A run of character data, up to the next `<`.
+    private chars(*self) -> Result[Event, XmlError]
+        val start = self.s.offset
+        var seg = start
+
+        self.copying = false
+
+        loop
+            self.s.skip_until_set(TEXT_STOP)
+
+            val c = self.s.peek() match
+                Some(c) -> c
+                None -> break
+
+            if c == u8('<') then break
+
+            if c == u8('&') then
+                self.flush(seg)
+                self.reference()?
+                seg = self.s.offset
+            elif c == u8('\r') then
+                self.flush(seg)
+                self.sb.bytes.push(u8('\n'))
+                self.s.bump()
+                self.s.accept(u8('\n'))
+                seg = self.s.offset
+            elif c == u8(']') then
+                if self.s.starts_with("]]>".bytes) then
+                    return Err(self.fail(self.s.offset, "`]]>` is not allowed in text; write `]]&gt;`"))
+
+                self.s.bump()
+            else
+                self.odd_byte()?
+
+        Ok(Text(self.gathered(start, seg)))
+    end chars
+
+    // A quoted attribute value, normalised as XML 1.0 § 3.3.3 says for an attribute with no declared
+    // type: each whitespace character becomes a space, a line end being one, and a reference is
+    // replaced -- `&#10;` by the newline it names, which is how a value keeps one.
+    private attr_value(*self) -> Result[string, XmlError]
+        val q = self.s.peek().unwrap_or(0)
+
+        if q != u8('"') && q != u8('\'') then
+            return Err(self.expected(self.s.offset, "a quoted attribute value"))
+
+        val open_at = self.s.offset
+
+        self.s.bump()
+
+        val start = self.s.offset
+        val stop = if q == u8('"') then ATTR_STOP_DQ else ATTR_STOP_SQ
+        var seg = start
+
+        self.copying = false
+
+        loop
+            self.s.skip_until_set(stop)
+
+            val c = self.s.peek() match
+                Some(c) -> c
+                None -> return Err(self.fail(open_at, "the attribute value is not closed; the input ended inside it"))
+
+            if c == q then
+                val v = self.gathered(start, seg)
+
+                self.s.bump()
+                return Ok(v)
+
+            if c == u8('<') then
+                return Err(self.fail(self.s.offset, "`<` is not allowed in an attribute value; write `&lt;`"))
+
+            if c == u8('&') then
+                self.flush(seg)
+                self.reference()?
+                seg = self.s.offset
+            elif c == u8('\t') || c == u8('\n') || c == u8('\r') then
+                self.flush(seg)
+                self.sb.bytes.push(u8(' '))
+                self.s.bump()
+
+                if c == u8('\r') then self.s.accept(u8('\n'))
+
+                seg = self.s.offset
+            else
+                self.odd_byte()?
+    end attr_value
+
+    // `&...;` at the cursor, its replacement pushed to the builder: one of the five predefined
+    // entities, or a character reference naming a character XML allows.
+    private reference(*self) -> Result[unit, XmlError]
+        val at = self.s.offset
+
+        self.s.bump()
+
+        if self.s.accept(u8('#')) then
+            val hex = self.s.accept(u8('x'))
+            val m = self.s.offset
+            val v = read_digits(&self.s, if hex then 16 else 10) match
+                Ok(v) -> v
+                Err(_) -> return Err(self.fail(at, "a character reference is `&#` and decimal digits, or `&#x` and hex digits, then `;`"))
+
+            for i in m..<self.s.offset
+                if self.text.bytes[i] == u8('_') then
+                    return Err(self.fail(at, "a character reference may not have `_` in its digits"))
+
+            if !self.s.accept(u8(';')) then
+                return Err(self.expected(self.s.offset, "`;` to end the character reference"))
+
+            if !is_xml_char(v) then
+                return Err(self.fail(at, s"`${self.text[at..<self.s.offset]}` does not name a character XML allows"))
+
+            self.sb.push_char(char_from_u32(u32(v)).expect("a Char is a scalar value"))
+            return Ok(())
+
+        if !self.name_char(true) then
+            return Err(self.fail(at, "`&` must begin a reference such as `&amp;` or `&#38;`; write `&amp;` for an ampersand"))
+
+        while self.name_char(false)
+            ()
+
+        val name = self.text[at + 1..<self.s.offset]
+
+        if !self.s.accept(u8(';')) then
+            return Err(self.expected(self.s.offset, s"`;` to end the reference `&$name`"))
+
+        if name == "lt" then
+            self.sb.bytes.push(u8('<'))
+        elif name == "gt" then
+            self.sb.bytes.push(u8('>'))
+        elif name == "amp" then
+            self.sb.bytes.push(u8('&'))
+        elif name == "apos" then
+            self.sb.bytes.push(u8('\''))
+        elif name == "quot" then
+            self.sb.bytes.push(u8('"'))
+        elif self.entity_decls then
+            return Err(self.fail(at, s"`&$name;` is not one of XML's five entities; entities declared in a DOCTYPE are not expanded by this reader"))
+        else
+            return Err(self.fail(at, s"`&$name;` is not one of XML's five entities (`lt`, `gt`, `amp`, `apos`, `quot`)"))
+
+        Ok(())
+    end reference
+
+    // A comment's, a CDATA section's or a processing instruction's text, up to `close`. Line ends are
+    // normalised and refused characters refused; a comment may not hold `--`.
+    private raw_until(*self, close: []const u8, what: string, at: usize) -> Result[string, XmlError]
+        val start = self.s.offset
+        val stop = RAW_STOP.with(close[0])
+        val comment = close[0] == u8('-')
+        var seg = start
+
+        self.copying = false
+
+        loop
+            self.s.skip_until_set(stop)
+
+            val c = self.s.peek() match
+                Some(c) -> c
+                None -> return Err(self.fail(at, s"the $what is not closed; the input ended inside it"))
+
+            if self.s.starts_with(close) then
+                val v = self.gathered(start, seg)
+
+                self.s.skip(close.len)
+                return Ok(v)
+
+            if comment && self.s.starts_with("--".bytes) then
+                return Err(self.fail(self.s.offset, "`--` is not allowed inside a comment"))
+
+            if c == u8('\r') then
+                self.flush(seg)
+                self.sb.bytes.push(u8('\n'))
+                self.s.bump()
+                self.s.accept(u8('\n'))
+                seg = self.s.offset
+            elif c == close[0] then
+                self.s.bump()
+            else
+                self.odd_byte()?
+    end raw_until
+
+    // `<?target data?>`. The target `xml`, in any case, is reserved for the declaration.
+    private pi(*self, at: usize) -> Result[Event, XmlError]
+        val t = self.read_name("a processing-instruction target after `<?`")?
+        val target = self.text[t.start..<t.end]
+
+        if eq_fold(target, "xml") then
+            return Err(self.fail(at, if target == "xml" then
+                "the XML declaration is only allowed at the very start of the document"
+            else
+                s"`$target` is reserved and may not be a processing-instruction target"))
+
+        if has_colon(target) then
+            return Err(self.fail(t.start, s"`$target` is not a processing-instruction target: under namespaces it may not hold a colon"))
+
+        if self.s.accept_seq("?>".bytes) then return Ok(Pi(target, ""))
+
+        if self.s.accept_while_set(SPACE) == 0 then
+            return Err(self.expected(self.s.offset, "whitespace or `?>` after the target"))
+
+        Ok(Pi(target, self.raw_until("?>".bytes, "processing instruction", at)?))
+    end pi
+end Reader
+
+// `1.` and at least one digit -- every XML 1.x version, which an XML 1.0 processor reads as 1.0.
+private is_version(v: string) -> bool
+    if v.len < 3 || v.bytes[0] != u8('1') || v.bytes[1] != u8('.') then return false
+
+    for i in 2..<v.len
+        if !v.bytes[i].is_digit() then return false
+
+    true
+end is_version

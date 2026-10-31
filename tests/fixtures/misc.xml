@@ -1,0 +1,29 @@
+<?xml version='1.0'?>
+<!-- before the DOCTYPE -->
+<!DOCTYPE doc SYSTEM "doc.dtd" [
+  <!-- a comment with > and ] and " in it -->
+  <?pi-in-subset data > here?>
+  <!ELEMENT doc ANY>
+  <!NOTATION n SYSTEM "with > inside">
+]>
+<?style href="a.css" type='text/css'?>
+<doc>
+  <élément attribut="valeur">texte</élément>
+  <a.b-c_d·e x="1"/>
+  <spaced  a = "1"   b='2' ></spaced >
+  <tabs v="a	b
+c   d"/>
+  <refs dec="&#65;&#0066;" hex="&#x43;&#x044;" mix="&#x1F600;&#xe9;" amp="&amp;&lt;&gt;&apos;&quot;"/>
+  <![CDATA[<not>markup</not> & ]] and ]>]]>
+  <![CDATA[]]>
+  text &amp; more &#x10FFFF; after]> fine
+  <!---->
+  <!-- - single dashes - are fine -->
+  <?empty?>
+  <?target   lots   of   space   ?>
+  <mixed>one<b>two</b>three<![CDATA[four]]>five</mixed>
+  <empty></empty>
+  <self/>
+</doc>
+<!-- after the root -->
+<?trailing pi?>

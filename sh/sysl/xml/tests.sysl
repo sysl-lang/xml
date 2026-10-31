@@ -1,0 +1,28 @@
+module sh.sysl.xml
+
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The tree reader's happy paths: what each kind of markup becomes.
+
+private doc(text: string) -> &Document = parse(text).expect(s"parses: $text")
+
+// The error a document is refused with, as `line:col: message`.
+private[xml] refusal(text: string) -> string
+    parse(text) match
+        Ok(_) -> "accepted"
+        Err(e) -> e.to_string()
+end refusal
+
+@test("an element with attributes and text reads back as written")
+element_attrs_text()
+    val d = doc("<c r=\"B2\" s='1'><v>42</v></c>")
+
+    assert_eq(d.root.local, "c")
+    assert_eq(d.root.attr("r"), Some("B2"))
+    assert_eq(d.root.attr("s"), Some("1"))
+    assert_eq(d.root.attr("t"), None)
+    assert_eq(d.root.child("v").map(e -> e.text()), Some("42"))
+    assert_eq(d.root.text(), "42")
+end element_attrs_text

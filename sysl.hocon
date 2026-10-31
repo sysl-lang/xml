@@ -1,0 +1,38 @@
+// XML 1.0 for sysl: read as a tree or as a stream of events, and written with the escaping done.
+//
+// `parse` reads a whole document into `Document` and `Element`s, with every name resolved to its
+// namespace; `reader` hands out the same document one `Event` at a time, so a file too large to want
+// as a tree never becomes one; `writer` builds a document into a `string`, the same bytes out for
+// the same calls in.
+//
+// This is the block a consumer writes to reach it:
+//
+//     dependencies {
+//       xml { git = "github.com/sysl-lang/xml", version = "0.1.0" }
+//     }
+//
+// The coordinate names the package, `xml`; the module a program imports is `sh.sysl.xml`.
+
+package {
+  name    = "xml"
+  version = "0.1.0"
+
+  // **The oldest compiler this builds with**, raised to the one it was last built and tested with.
+  sysl = "0.8.10"
+}
+
+// **`heap = true`**: a tree is made of counted `Element`s, an element's attributes and children are
+// gathered in `Buf`s, and text that held a reference or a carriage return is copied out into a new
+// `string`.
+//
+// **What is NOT here is `os` or `posix`.** This package opens nothing: a caller hands over text and
+// gets a document back, or hands over calls and gets text. The tests read fixtures from disk and run
+// Python's expat as an oracle, but a consumer never builds them.
+requires {
+  heap = true
+}
+
+// The cursor, the byte tables and the numeric-reference digits the reader is written with.
+dependencies {
+  parsing { git = "github.com/sysl-lang/parsing", version = "0.13.3" }
+}
