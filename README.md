@@ -11,14 +11,17 @@ import sh.sysl.xml.*
 
 val book = parse_bytes(entry_bytes)?                     // a Document, or an XmlError with line:col
 
-for sheet in book.root.child("sheets")?.elements_named("sheet").view()
-    print(sheet.attr("name"), sheet.attr_ns(REL, "id"))  // `r:id`, whatever the prefix is spelled
+book.root.child("sheets") match
+    Some(sheets) ->
+        for sheet in sheets.elements_named("sheet")
+            print(sheet.attr("name"), sheet.attr_ns(REL, "id"))   // `r:id`, whatever the prefix
+    None -> ()
 
 var r = reader(sheet_xml)                                // a 50 MB sheet need not become a tree
 
 loop
     r.next()? match
-        Start(name, attrs, _) -> if name.local == "c" then count += 1
+        Start(name, _, _) -> if name.local == "c" then count += 1
         Text(t) -> total += parse_long(t)?
         Eof -> break
         _ -> ()
@@ -57,7 +60,7 @@ struct Document
     doctype: string                  // the name a DOCTYPE gave, or ""
     children: Buf[Node]              // comments and PIs around the root, and the root, in order
     root: &Element
-    to_xml(self) -> string
+    to_xml(self) -> Result[string, WriteError]   // a DOCTYPE is not written
 
 struct Element                       // derives Eq: two are equal when they are the same tree
     name: Name
@@ -72,7 +75,7 @@ struct Element                       // derives Eq: two are equal when they are 
     elements(self) -> Buf[&Element]
     elements_named(self, local: string) -> Buf[&Element]
     text(self) -> string             // text and CDATA, all the way down
-    to_xml(self) -> string
+    to_xml(self) -> Result[string, WriteError]   // declares the prefixes it inherited
 
 enum Node      Elem(&Element) | Text(string) | CData(string) | Comment(string) | Pi(target, data)
 struct Name    qname, prefix, local, ns: string;  is(self, ns, local) -> bool

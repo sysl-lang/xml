@@ -81,6 +81,12 @@ struct XmlWriter
 
         if !prefix.is_empty() && !is_ncname(prefix) then return self.refuse(s"`$prefix` is not a namespace prefix")
 
+        // The constraints the reader holds a declaration to, so that nothing written is refused when
+        // it is read back.
+        if prefix == "xmlns" || (prefix == "xml") != (uri == XML_NS) || uri == XMLNS_NS ||
+            (!prefix.is_empty() && uri.is_empty()) then
+            return self.refuse(s"`$prefix` cannot be bound to `$uri`")
+
         self.out.push(if prefix.is_empty() then " xmlns=\"" else " xmlns:")
 
         if !prefix.is_empty() then
@@ -251,22 +257,37 @@ struct XmlWriter
     end escaped
 end XmlWriter
 
-private[xml] write_node(w: *XmlWriter, n: Node)
+// A tree written out. `scope` is every declaration the output has in force at this point.
+private[xml] write_node(w: *XmlWriter, n: Node, scope: *Buf[NsDecl])
     n match
-        Elem(e) -> write_element(w, e)
+        Elem(e) -> write_element(w, e, scope)
         Text(t) -> w.text(t)
         CData(t) -> w.cdata(t)
         Comment(t) -> w.comment(t)
         Pi(t, d) -> w.pi(t, d)
 end write_node
 
-private[xml] write_element(w: *XmlWriter, e: &Element)
+// An element and everything in it, with its own declarations -- and with any declaration its names
+// need that the output does not have in force. That second kind is what makes `to_xml` on an element
+// deep inside a document stand on its own: `<a:x>` whose `xmlns:a` was on an ancestor is written with
+// one, since `Name.ns` says what the prefix meant where it was read.
+private[xml] write_element(w: *XmlWriter, e: &Element, scope: *Buf[NsDecl])
+    val mark = scope.len()
+
     w.open(e.name.qname)
 
     for i in 0..<e.decls.len()
         val d = e.decls.at(i)
 
         w.ns(d.prefix, d.uri)
+        scope.push(d)
+
+    declare_if_needed(w, scope, e.name.prefix, e.name.ns)
+
+    for i in 0..<e.attrs.len()
+        val a = e.attrs.at(i)
+
+        if !a.name.prefix.is_empty() then declare_if_needed(w, scope, a.name.prefix, a.name.ns)
 
     for i in 0..<e.attrs.len()
         val a = e.attrs.at(i)
@@ -274,7 +295,34 @@ private[xml] write_element(w: *XmlWriter, e: &Element)
         w.attr(a.name.qname, a.value)
 
     for i in 0..<e.children.len()
-        write_node(w, e.children.at(i))
+        write_node(w, e.children.at(i), scope)
 
     w.close()
+    scope.truncate(mark)
 end write_element
+
+// `xmlns:prefix="ns"` on the element being written, unless the output already binds `prefix` to `ns`
+// here. The default namespace is the prefix "", whose being unbound means no namespace.
+private declare_if_needed(w: *XmlWriter, scope: *Buf[NsDecl], prefix: string, ns: string)
+    if prefix == "xml" then return
+
+    var bound: Option[string] = None
+    var i = scope.len()
+
+    while i > 0
+        i -= 1
+
+        if scope.at(i).prefix == prefix then
+            bound = Some(scope.at(i).uri)
+            break
+
+    // An unbound default is no namespace; an unbound prefix is nothing at all, and is declared even
+    // where `ns` is "" -- which `ns` then refuses, since a prefix cannot stand for no namespace.
+    val same = bound match
+        Some(uri) -> uri == ns
+        None -> prefix.is_empty() && ns.is_empty()
+
+    if !same then
+        w.ns(prefix, ns)
+        scope.push(NsDecl(prefix, ns))
+end declare_if_needed

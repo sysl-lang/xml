@@ -186,10 +186,10 @@ fixtures_round_trip()
     for i in 0..<names.len()
         val name = names.at(i)
         val text = fixture(name)
-        val again = parse(text).unwrap().to_xml()
+        val again = parse(text).unwrap().to_xml().unwrap()
 
         assert_eq(dump_tree(again), dump_tree(text), name)
 
         // Writing is a fixed point: the second writing is the first, byte for byte.
-        assert_eq(parse(again).unwrap().to_xml(), again, name)
+        assert_eq(parse(again).unwrap().to_xml(), Ok(again), name)
 end fixtures_round_trip

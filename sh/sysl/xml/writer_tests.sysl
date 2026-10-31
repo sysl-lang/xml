@@ -4,6 +4,8 @@ module sh.sysl.xml
 
 // The writer: the exact bytes it makes, the escaping a reader undoes, and the mistakes it holds.
 
+import sysl.buf.buf
+
 private val MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 private val R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
@@ -122,12 +124,44 @@ end comments_and_pis
 tree_round_trip()
     val text = "<?xml version=\"1.0\"?>\n<!--c--><a:r xmlns:a=\"u\" xmlns=\"d\" x=\"1\" a:y=\"&#9;\"><e/>t&amp;<![CDATA[<c>]]><?p d?><f xmlns=\"\">x</f></a:r>"
     val d = parse(text).unwrap()
-    val again = parse(d.to_xml()).unwrap()
+    val again = parse(d.to_xml().unwrap()).unwrap()
 
     assert_eq(again.root, d.root)
     assert_eq(again.children, d.children)
-    assert_eq(d.root.to_xml(), "<a:r xmlns:a=\"u\" xmlns=\"d\" x=\"1\" a:y=\"&#9;\"><e/>t&amp;<![CDATA[<c>]]><?p d?><f xmlns=\"\">x</f></a:r>")
+    assert_eq(d.root.to_xml(), Ok("<a:r xmlns:a=\"u\" xmlns=\"d\" x=\"1\" a:y=\"&#9;\"><e/>t&amp;<![CDATA[<c>]]><?p d?><f xmlns=\"\">x</f></a:r>"))
 end tree_round_trip
+
+@test("an element written out from deep in a document declares the prefixes it inherited")
+subtree_stands_alone()
+    val d = parse("<r xmlns='u' xmlns:a='v'><a:x a:y='1' xml:lang='en'><z/><a:w/></a:x><q xmlns:a='v'><a:k/></q></r>").unwrap()
+    val x = d.root.child("x").unwrap()
+
+    assert_eq(x.to_xml(), Ok("<a:x xmlns:a=\"v\" a:y=\"1\" xml:lang=\"en\"><z xmlns=\"u\"/><a:w/></a:x>"))
+    // Read back, every name resolves as it did in the whole document.
+    val back = parse(x.to_xml().unwrap()).unwrap().root
+
+    assert_eq(back.name, x.name)
+    assert_eq(back.attrs, x.attrs)
+    assert_eq(back.elements().at(0).name, x.elements().at(0).name)
+    assert_eq(back.elements().at(1).name, x.elements().at(1).name)
+
+    // Where the element carries the declaration itself, it is written once.
+    assert_eq(d.root.child("q").unwrap().to_xml(), Ok("<q xmlns:a=\"v\" xmlns=\"u\"><a:k/></q>"))
+
+    // An attribute's prefix is declared too, and a child back in no namespace says so.
+    val e = parse("<r xmlns='u' xmlns:b='w'><s b:t='1'><n xmlns=''/></s></r>").unwrap().root.child("s").unwrap()
+
+    assert_eq(e.to_xml(), Ok("<s xmlns=\"u\" xmlns:b=\"w\" b:t=\"1\"><n xmlns=\"\"/></s>"))
+end subtree_stands_alone
+
+@test("a tree built by hand with a name that is not one is refused, not written")
+hand_built_tree()
+    val bad: &Element = Element(Name("1x", "", "1x", ""), buf(), buf(), buf())
+    val orphan: &Element = Element(Name("p:x", "p", "x", ""), buf(), buf(), buf())
+
+    assert_eq(bad.to_xml().map_err(e -> e.message), Err("`1x` is not an element name"))
+    assert_eq(orphan.to_xml().map_err(e -> e.message), Err("`p` cannot be bound to ``"))
+end hand_built_tree
 
 @test("two trees that differ anywhere are not equal")
 tree_inequality()
@@ -251,4 +285,20 @@ writer_mistakes()
     q.ns("x:y", "u")
     q.close()
     assert_eq(mistake(q), "`x:y` is not a namespace prefix")
+
+    for (prefix, uri) in [("xml", "u"), ("x", XML_NS), ("xmlns", "u"), ("x", XMLNS_NS), ("x", "")]
+        var s = writer()
+
+        s.open("r")
+        s.ns(prefix, uri)
+        s.close()
+        assert_eq(mistake(s), s"`$prefix` cannot be bound to `$uri`")
+
+    var t = writer()
+
+    t.open("r")
+    t.ns("xml", XML_NS)
+    t.ns("", "")
+    t.close()
+    assert_eq(mistake(t), s"written: <r xmlns:xml=\"$XML_NS\" xmlns=\"\"/>")
 end writer_mistakes

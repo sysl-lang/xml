@@ -109,12 +109,17 @@ struct Element derives Eq
         b.finish()
     end text
 
-    // This element written out as XML, with no declaration -- what `Writer` would make of it.
-    to_xml(self) -> string
+    // This element written out as XML, with no XML declaration. It stands on its own: a prefix it
+    // uses that was declared on an ancestor is declared on it.
+    //
+    // A tree the reader made always writes; one built by hand can hold a name that is not one, and
+    // that is the error.
+    to_xml(self) -> Result[string, WriteError]
         var w = writer()
+        var scope: Buf[NsDecl] = buf()
 
-        write_element(&w, self)
-        w.finish().expect("a tree the reader made is one the writer can write")
+        write_element(&w, self, &scope)
+        w.finish()
 end Element
 
 private gather_text(children: Buf[Node], b: *StrBuilder)
@@ -142,15 +147,16 @@ struct Document
 
     // The document written out as XML. The declaration is written where the document had one, and a
     // DOCTYPE is not written at all.
-    to_xml(self) -> string
+    to_xml(self) -> Result[string, WriteError]
         var w = writer()
+        var scope: Buf[NsDecl] = buf()
 
         if !self.version.is_empty() then w.declaration(self.standalone)
 
         for i in 0..<self.children.len()
-            write_node(&w, self.children.at(i))
+            write_node(&w, self.children.at(i), &scope)
 
-        w.finish().expect("a tree the reader made is one the writer can write")
+        w.finish()
     end to_xml
 end Document
 
