@@ -188,7 +188,7 @@ struct XmlWriter
             None -> ()
 
         if !self.stack.is_empty() then
-            return Err(WriteError(s"`<${self.stack.at(self.stack.len() - 1)}>` is still open"))
+            return Err(WriteError(s"`<${self.stack[self.stack.len() - 1]}>` is still open"))
 
         if !self.wrote_root then return Err(WriteError("a document needs a root element"))
 
@@ -249,11 +249,11 @@ struct XmlWriter
                 ""
 
             if !rep.is_empty() then
-                self.out.bytes.extend(text.bytes[seg..<i])
+                self.out.push(text[seg..<i])
                 self.out.push(rep)
                 seg = i + 1
 
-        self.out.bytes.extend(text.bytes[seg..<text.len])
+        self.out.push(text[seg..<text.len])
     end escaped
 end XmlWriter
 
@@ -277,7 +277,7 @@ private[xml] write_element(w: *XmlWriter, e: &Element, scope: *Buf[NsDecl])
     w.open(e.name.qname)
 
     for i in 0..<e.decls.len()
-        val d = e.decls.at(i)
+        val d = e.decls[i]
 
         w.ns(d.prefix, d.uri)
         scope.push(d)
@@ -285,17 +285,17 @@ private[xml] write_element(w: *XmlWriter, e: &Element, scope: *Buf[NsDecl])
     declare_if_needed(w, scope, e.name.prefix, e.name.ns)
 
     for i in 0..<e.attrs.len()
-        val a = e.attrs.at(i)
+        val a = e.attrs[i]
 
         if !a.name.prefix.is_empty() then declare_if_needed(w, scope, a.name.prefix, a.name.ns)
 
     for i in 0..<e.attrs.len()
-        val a = e.attrs.at(i)
+        val a = e.attrs[i]
 
         w.attr(a.name.qname, a.value)
 
     for i in 0..<e.children.len()
-        write_node(w, e.children.at(i), scope)
+        write_node(w, e.children[i], scope)
 
     w.close()
     scope.truncate(mark)
@@ -312,8 +312,8 @@ private declare_if_needed(w: *XmlWriter, scope: *Buf[NsDecl], prefix: string, ns
     while i > 0
         i -= 1
 
-        if scope.at(i).prefix == prefix then
-            bound = Some(scope.at(i).uri)
+        if scope[i].prefix == prefix then
+            bound = Some(scope[i].uri)
             break
 
     // An unbound default is no namespace; an unbound prefix is nothing at all, and is declared even

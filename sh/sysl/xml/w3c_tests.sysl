@@ -100,30 +100,28 @@ private kept_by_design(name: string) -> bool
 // Text in the canonical form's escaping: the three markup characters, the quote, and the three
 // whitespace characters as references.
 private canon_text(b: *StrBuilder, t: string)
-    for i in 0..<t.len
-        val c = t.bytes[i]
-
-        if c == u8('&') then
+    for c in t.chars
+        if c == '&' then
             b.push("&amp;")
-        elif c == u8('<') then
+        elif c == '<' then
             b.push("&lt;")
-        elif c == u8('>') then
+        elif c == '>' then
             b.push("&gt;")
-        elif c == u8('"') then
+        elif c == '"' then
             b.push("&quot;")
-        elif c == u8('\t') then
+        elif c == '\t' then
             b.push("&#9;")
-        elif c == u8('\n') then
+        elif c == '\n' then
             b.push("&#10;")
-        elif c == u8('\r') then
+        elif c == '\r' then
             b.push("&#13;")
         else
-            b.bytes.push(c)
+            b.push_char(c)
 end canon_text
 
 private canon_nodes(b: *StrBuilder, nodes: Buf[Node])
     for i in 0..<nodes.len()
-        nodes.at(i) match
+        nodes[i] match
             Elem(e) -> canon_element(b, e)
             Node.Text(t) -> canon_text(b, t)
             Node.CData(t) -> canon_text(b, t)
@@ -142,12 +140,12 @@ private canon_element(b: *StrBuilder, e: &Element)
     var attrs: Buf[(string, string)] = buf()
 
     for i in 0..<e.decls.len()
-        val d = e.decls.at(i)
+        val d = e.decls[i]
 
         attrs.push((if d.prefix.is_empty() then "xmlns" else s"xmlns:${d.prefix}", d.uri))
 
     for i in 0..<e.attrs.len()
-        attrs.push((e.attrs.at(i).name.qname, e.attrs.at(i).value))
+        attrs.push((e.attrs[i].name.qname, e.attrs[i].value))
 
     sort_by(attrs.view(), (x, y) -> x.0 < y.0)
 
@@ -156,9 +154,9 @@ private canon_element(b: *StrBuilder, e: &Element)
 
     for i in 0..<attrs.len()
         b.push(" ")
-        b.push(attrs.at(i).0)
+        b.push(attrs[i].0)
         b.push("=\"")
-        canon_text(b, attrs.at(i).1)
+        canon_text(b, attrs[i].1)
         b.push("\"")
 
     b.push(">")

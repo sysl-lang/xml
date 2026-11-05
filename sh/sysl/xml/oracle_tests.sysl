@@ -36,19 +36,17 @@ private[xml] fixture(name: string) -> string =
 private[xml] esc(text: string) -> string
     var b = str_builder()
 
-    for i in 0..<text.len
-        val c = text.bytes[i]
-
-        if c == u8('\\') then
+    for c in text.chars
+        if c == '\\' then
             b.push("\\\\")
-        elif c == u8('\n') then
+        elif c == '\n' then
             b.push("\\n")
-        elif c == u8('\r') then
+        elif c == '\r' then
             b.push("\\r")
-        elif c == u8('\t') then
+        elif c == '\t' then
             b.push("\\t")
         else
-            b.bytes.push(c)
+            b.push_char(c)
 
     b.finish()
 end esc
@@ -83,10 +81,10 @@ private[xml] struct Dump
         self.line(s"S ${expanded(name)}")
 
         for i in 0..<decls.len()
-            self.line(s"N ${decls.at(i).prefix} ${esc(decls.at(i).uri)}")
+            self.line(s"N ${decls[i].prefix} ${esc(decls[i].uri)}")
 
         for i in 0..<attrs.len()
-            self.line(s"A ${expanded(attrs.at(i).name)} ${esc(attrs.at(i).value)}")
+            self.line(s"A ${expanded(attrs[i].name)} ${esc(attrs[i].value)}")
     end start
 
     finish(*self) -> string
@@ -119,7 +117,7 @@ end dump_events
 
 private dump_nodes(d: *Dump, nodes: Buf[Node])
     for i in 0..<nodes.len()
-        nodes.at(i) match
+        nodes[i] match
             Elem(e) ->
                 d.start(e.name, e.attrs, e.decls)
                 dump_nodes(d, e.children)
@@ -150,7 +148,7 @@ private[xml] fixture_names() -> Buf[string]
     val all = entries(s"${fixtures_dir()}/fixtures").unwrap()
 
     for i in 0..<all.len()
-        if all.at(i).ends_with(".xml") then out.push(all.at(i))
+        if all[i].ends_with(".xml") then out.push(all[i])
 
     out
 end fixture_names
@@ -162,7 +160,7 @@ tree_matches_expat()
     assert(names.len() >= 8, "the fixtures are found")
 
     for i in 0..<names.len()
-        val name = names.at(i)
+        val name = names[i]
         val want = expat(s"${fixtures_dir()}/fixtures/$name")
 
         assert(want != "ERROR\n" && want.len > 0, s"expat reads $name")
@@ -174,7 +172,7 @@ events_match_expat()
     val names = fixture_names()
 
     for i in 0..<names.len()
-        val name = names.at(i)
+        val name = names[i]
 
         assert_eq(dump_events(fixture(name)), expat(s"${fixtures_dir()}/fixtures/$name"), name)
 end events_match_expat
@@ -184,7 +182,7 @@ fixtures_round_trip()
     val names = fixture_names()
 
     for i in 0..<names.len()
-        val name = names.at(i)
+        val name = names[i]
         val text = fixture(name)
         val again = parse(text).unwrap().to_xml().unwrap()
 

@@ -65,8 +65,8 @@ round_trip()
 
     assert_eq(d.standalone, Some(true))
     assert_eq(d.root.name.ns, MAIN)
-    assert_eq(c.at(0).text(), "Fish & chips <2>")
-    assert_eq(c.at(1).child("v").unwrap().text(), "42")
+    assert_eq(c[0].text(), "Fish & chips <2>")
+    assert_eq(c[1].child("v").unwrap().text(), "42")
     assert_eq(d.root.child("pageSetup").unwrap().attr_ns(R, "id"), Some("rId1"))
 end round_trip
 
@@ -142,8 +142,8 @@ subtree_stands_alone()
 
     assert_eq(back.name, x.name)
     assert_eq(back.attrs, x.attrs)
-    assert_eq(back.elements().at(0).name, x.elements().at(0).name)
-    assert_eq(back.elements().at(1).name, x.elements().at(1).name)
+    assert_eq(back.elements()[0].name, x.elements()[0].name)
+    assert_eq(back.elements()[1].name, x.elements()[1].name)
 
     // Where the element carries the declaration itself, it is written once.
     assert_eq(d.root.child("q").unwrap().to_xml(), Ok("<q xmlns:a=\"v\" xmlns=\"u\"><a:k/></q>"))

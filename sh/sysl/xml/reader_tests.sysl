@@ -30,16 +30,16 @@ event_sequence()
     attrs.push(Attr(plain("a", "a"), "1"))
 
     assert_eq(got.len(), 10)
-    assert_eq(got.at(0), Doctype("r"))
-    assert_eq(got.at(1), Event.Comment("c"))
-    assert_eq(got.at(2), Start(plain("r", "r"), attrs, buf()))
-    assert_eq(got.at(3), Start(plain("e", "e"), buf(), buf()))
-    assert_eq(got.at(4), End(plain("e", "e")))
-    assert_eq(got.at(5), Event.Text("t"))
-    assert_eq(got.at(6), Event.CData("d"))
-    assert_eq(got.at(7), Event.Pi("p", "q"))
-    assert_eq(got.at(8), End(plain("r", "r")))
-    assert_eq(got.at(9), Eof)
+    assert_eq(got[0], Doctype("r"))
+    assert_eq(got[1], Event.Comment("c"))
+    assert_eq(got[2], Start(plain("r", "r"), attrs, buf()))
+    assert_eq(got[3], Start(plain("e", "e"), buf(), buf()))
+    assert_eq(got[4], End(plain("e", "e")))
+    assert_eq(got[5], Event.Text("t"))
+    assert_eq(got[6], Event.CData("d"))
+    assert_eq(got[7], Event.Pi("p", "q"))
+    assert_eq(got[8], End(plain("r", "r")))
+    assert_eq(got[9], Eof)
 end event_sequence
 
 @test("whitespace inside the root is text, and outside it is not an event at all")
@@ -47,9 +47,9 @@ whitespace_events()
     val got = events("\n <r>\n <e/>\n</r>\n ").unwrap()
 
     assert_eq(got.len(), 7)
-    assert_eq(got.at(0), Start(plain("r", "r"), buf(), buf()))
-    assert_eq(got.at(1), Event.Text("\n "))
-    assert_eq(got.at(4), Event.Text("\n"))
+    assert_eq(got[0], Start(plain("r", "r"), buf(), buf()))
+    assert_eq(got[1], Event.Text("\n "))
+    assert_eq(got[4], Event.Text("\n"))
 end whitespace_events
 
 @test("the declaration is read before the first event, and the end answers `Eof` again when asked again")
@@ -161,13 +161,13 @@ big_document()
     assert_eq(data.len(), rows)
 
     for i in 0..<data.len()
-        val cs = data.at(i).elements_named("c")
+        val cs = data[i].elements_named("c")
 
         for j in 0..<cs.len()
-            tree_sum += parse_long(cs.at(j).text()).unwrap()
+            tree_sum += parse_long(cs[j].text()).unwrap()
 
     assert_eq(tree_sum, want)
-    assert_eq(data.at(rows - 1).elements_named("c").at(7).attr("r"), Some(s"H$rows"))
+    assert_eq(data[rows - 1].elements_named("c")[7].attr("r"), Some(s"H$rows"))
 end big_document
 
 @test("an element's declarations go out of scope at its end, with the reader still inside the parent")

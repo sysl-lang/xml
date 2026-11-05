@@ -41,7 +41,7 @@ val text = w.finish()?                                   // the same bytes for t
 
 ```hocon
 dependencies {
-  xml { git = "github.com/sysl-lang/xml", version = "0.1.0" }
+  xml { git = "github.com/sysl-lang/xml", version = "0.1.1" }
 }
 ```
 

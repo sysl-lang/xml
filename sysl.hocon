@@ -8,17 +8,17 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       xml { git = "github.com/sysl-lang/xml", version = "0.1.0" }
+//       xml { git = "github.com/sysl-lang/xml", version = "0.1.1" }
 //     }
 //
 // The coordinate names the package, `xml`; the module a program imports is `sh.sysl.xml`.
 
 package {
   name    = "xml"
-  version = "0.1.0"
+  version = "0.1.1"
 
   // **The oldest compiler this builds with**, raised to the one it was last built and tested with.
-  sysl = "0.8.10"
+  sysl = "0.9.0"
 }
 
 // **`heap = true`**: a tree is made of counted `Element`s, an element's attributes and children are
@@ -34,5 +34,5 @@ requires {
 
 // The cursor, the byte tables and the numeric-reference digits the reader is written with.
 dependencies {
-  parsing { git = "github.com/sysl-lang/parsing", version = "0.13.3" }
+  parsing { git = "github.com/sysl-lang/parsing", version = "0.14.1" }
 }

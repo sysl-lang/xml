@@ -29,7 +29,7 @@ struct Element derives Eq
     // `attr("r")` on `<c r="B2">` is `Some("B2")`.
     attr(self, local: string) -> Option[string]
         for i in 0..<self.attrs.len()
-            val a = self.attrs.at(i)
+            val a = self.attrs[i]
 
             if a.name.local == local then return Some(a.value)
 
@@ -41,7 +41,7 @@ struct Element derives Eq
     // an `r:id`.
     attr_ns(self, ns: string, local: string) -> Option[string]
         for i in 0..<self.attrs.len()
-            val a = self.attrs.at(i)
+            val a = self.attrs[i]
 
             if a.name.local == local && a.name.ns == ns then return Some(a.value)
 
@@ -51,7 +51,7 @@ struct Element derives Eq
     // The first child element with this local name.
     child(self, local: string) -> Option[&Element]
         for i in 0..<self.children.len()
-            self.children.at(i) match
+            self.children[i] match
                 Elem(e) -> if e.name.local == local then return Some(e)
                 _ -> ()
 
@@ -61,7 +61,7 @@ struct Element derives Eq
     // The first child element with this namespace and local name.
     child_ns(self, ns: string, local: string) -> Option[&Element]
         for i in 0..<self.children.len()
-            self.children.at(i) match
+            self.children[i] match
                 Elem(e) -> if e.name.is(ns, local) then return Some(e)
                 _ -> ()
 
@@ -73,7 +73,7 @@ struct Element derives Eq
         var out: Buf[&Element] = buf()
 
         for i in 0..<self.children.len()
-            self.children.at(i) match
+            self.children[i] match
                 Elem(e) -> out.push(e)
                 _ -> ()
 
@@ -85,7 +85,7 @@ struct Element derives Eq
         var out: Buf[&Element] = buf()
 
         for i in 0..<self.children.len()
-            self.children.at(i) match
+            self.children[i] match
                 Elem(e) -> if e.name.local == local then out.push(e)
                 _ -> ()
 
@@ -98,7 +98,7 @@ struct Element derives Eq
         // One child holding text is the usual case -- `<v>42</v>`, `<t>Total</t>` -- and it is the
         // input's own slice, so it is handed back without a copy.
         if self.children.len() == 1 then
-            self.children.at(0) match
+            self.children[0] match
                 Text(t) -> return t
                 CData(t) -> return t
                 _ -> ()
@@ -124,7 +124,7 @@ end Element
 
 private gather_text(children: Buf[Node], b: *StrBuilder)
     for i in 0..<children.len()
-        children.at(i) match
+        children[i] match
             Elem(c) -> gather_text(c.children, b)
             Text(t) -> b.push(t)
             CData(t) -> b.push(t)
@@ -154,7 +154,7 @@ struct Document
         if !self.version.is_empty() then w.declaration(self.standalone)
 
         for i in 0..<self.children.len()
-            write_node(&w, self.children.at(i), &scope)
+            write_node(&w, self.children[i], &scope)
 
         w.finish()
     end to_xml
@@ -199,8 +199,8 @@ parse(text: string) -> Result[&Document, XmlError]
         else
             node match
                 Elem(e) ->
-                    if stack.len() > 1 then stack.at(stack.len() - 2).children.push(Node.Elem(e))
-                _ -> stack.at(stack.len() - 1).children.push(node)
+                    if stack.len() > 1 then stack[stack.len() - 2].children.push(Node.Elem(e))
+                _ -> stack[stack.len() - 1].children.push(node)
 
     Ok(Document(r.version, r.encoding, r.standalone, doctype, top,
         root.expect("the reader refuses a document with no root element")))

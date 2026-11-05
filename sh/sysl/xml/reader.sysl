@@ -132,7 +132,7 @@ struct Reader
                 val n = self.open.len() - 1
 
                 Err(self.fail(self.s.offset,
-                    s"the input ended inside `<${self.open.at(n)}>`, opened at ${self.loc(self.opened.at(n))}"))
+                    s"the input ended inside `<${self.open[n]}>`, opened at ${self.loc(self.opened[n])}"))
             Some(c) -> if c == u8('<') then self.markup() else self.chars()
     end next
 
@@ -476,14 +476,14 @@ struct Reader
             val value = self.attr_value()?
 
             for i in 0..<attrs.len()
-                if attrs.at(i).name.qname == aq then
+                if attrs[i].name.qname == aq then
                     return Err(self.fail(an_at, s"the attribute `$aq` is given twice in one start tag"))
 
             if aq == "xmlns" || (aq.len > 6 && aq.bytes[5] == u8(':') && aq.starts_with("xmlns:")) then
                 val prefix = if aq.len == 5 then "" else aq[6..]
 
                 for i in 0..<decls.len()
-                    if decls.at(i).prefix == prefix then
+                    if decls[i].prefix == prefix then
                         return Err(self.fail(an_at, s"the attribute `$aq` is given twice in one start tag"))
 
                 self.check_decl(an_at, prefix, value)?
@@ -497,24 +497,24 @@ struct Reader
         self.marks.push(self.scopes.len())
 
         for i in 0..<decls.len()
-            self.scopes.push(decls.at(i))
+            self.scopes.push(decls[i])
 
         val (prefix, local) = self.split(at + 1, qname)?
         val ns = self.resolve(at + 1, prefix, true)?
         val name = Name(qname, prefix, local, ns)
 
         for i in 0..<attrs.len()
-            var a = attrs.at(i)
+            var a = attrs[i]
 
             if !a.name.prefix.is_empty() then
-                a.name.ns = self.resolve(self.attr_at.at(i), a.name.prefix, false)?
-                attrs.set(i, a)
+                a.name.ns = self.resolve(self.attr_at[i], a.name.prefix, false)?
+                attrs[i] = a
 
                 for j in 0..<i
-                    val b = attrs.at(j)
+                    val b = attrs[j]
 
                     if b.name.local == a.name.local && b.name.ns == a.name.ns then
-                        return Err(self.fail(self.attr_at.at(i),
+                        return Err(self.fail(self.attr_at[i],
                             s"`${a.name.qname}` and `${b.name.qname}` are the same attribute: both are `${a.name.local}` in `${a.name.ns}`"))
 
         self.open.push(name)
@@ -536,10 +536,10 @@ struct Reader
             return Err(self.fail(at, s"`</$qname>` closes an element that was never opened"))
 
         val n = self.open.len() - 1
-        val want = self.open.at(n).qname
+        val want = self.open[n].qname
 
         if want != qname then
-            return Err(self.fail(at, s"`</$qname>` does not close `<$want>`, opened at ${self.loc(self.opened.at(n))}"))
+            return Err(self.fail(at, s"`</$qname>` does not close `<$want>`, opened at ${self.loc(self.opened[n])}"))
 
         Ok(End(self.close()))
     end end_tag
@@ -601,7 +601,7 @@ struct Reader
         while i > 0
             i -= 1
 
-            val d = self.scopes.at(i)
+            val d = self.scopes[i]
 
             if d.prefix == prefix then return Ok(d.uri)
 
@@ -654,7 +654,7 @@ struct Reader
             self.sb.clear()
             self.copying = true
 
-        self.sb.bytes.extend(self.text.bytes[seg..<self.s.offset])
+        self.sb.push(self.text[seg..<self.s.offset])
     end flush
 
     // What a run gathered from `start`: the input itself if nothing was replaced, else the builder.
@@ -704,7 +704,7 @@ struct Reader
                 seg = self.s.offset
             elif c == u8('\r') then
                 self.flush(seg)
-                self.sb.bytes.push(u8('\n'))
+                self.sb.push_char('\n')
                 self.s.bump()
                 self.s.accept(u8('\n'))
                 seg = self.s.offset
@@ -760,7 +760,7 @@ struct Reader
                 seg = self.s.offset
             elif c == u8('\t') || c == u8('\n') || c == u8('\r') then
                 self.flush(seg)
-                self.sb.bytes.push(u8(' '))
+                self.sb.push_char(' ')
                 self.s.bump()
 
                 if c == u8('\r') then self.s.accept(u8('\n'))
@@ -809,15 +809,15 @@ struct Reader
             return Err(self.expected(self.s.offset, s"`;` to end the reference `&$name`"))
 
         if name == "lt" then
-            self.sb.bytes.push(u8('<'))
+            self.sb.push_char('<')
         elif name == "gt" then
-            self.sb.bytes.push(u8('>'))
+            self.sb.push_char('>')
         elif name == "amp" then
-            self.sb.bytes.push(u8('&'))
+            self.sb.push_char('&')
         elif name == "apos" then
-            self.sb.bytes.push(u8('\''))
+            self.sb.push_char('\'')
         elif name == "quot" then
-            self.sb.bytes.push(u8('"'))
+            self.sb.push_char('"')
         elif self.entity_decls then
             return Err(self.fail(at, s"`&$name;` is not one of XML's five entities; entities declared in a DOCTYPE are not expanded by this reader"))
         else
@@ -854,7 +854,7 @@ struct Reader
 
             if c == u8('\r') then
                 self.flush(seg)
-                self.sb.bytes.push(u8('\n'))
+                self.sb.push_char('\n')
                 self.s.bump()
                 self.s.accept(u8('\n'))
                 seg = self.s.offset
